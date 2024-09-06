@@ -1,4 +1,5 @@
 //! Block allocation.
+use super::chunk_alloc::{ChunkAllocTable, CHUNK_SIZE};
 use super::sworndisk::Hba;
 use crate::layers::bio::{BlockSet, Buf, BufRef, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogStore};
@@ -21,6 +22,7 @@ const BUCKET_BLOCK_ALLOC_LOG: &str = "BAL";
 /// which manages validities of user data blocks.
 pub(super) struct AllocTable {
     bitmap: Mutex<BitMap>,
+    chunk_alloc_tables: Vec<ChunkAllocTable>,
     next_avail: AtomicUsize,
     nblocks: NonZeroUsize,
     is_dirty: AtomicBool,
@@ -51,8 +53,20 @@ const DIFF_RECORD_SIZE: usize = size_of::<AllocDiff>() + size_of::<Hba>();
 impl AllocTable {
     /// Create a new `AllocTable` given the total number of blocks.
     pub fn new(nblocks: NonZeroUsize) -> Self {
+        let total_blocks = nblocks.get();
+        let chunk_nums = total_blocks / CHUNK_SIZE;
+        let mut chunk_alloc_tables = Vec::with_capacity(chunk_nums);
+        for id in 0..chunk_nums {
+            let block_nums = if id < chunk_nums - 1 {
+                CHUNK_SIZE
+            } else {
+                total_blocks % CHUNK_SIZE
+            };
+            chunk_alloc_tables.push(ChunkAllocTable::new(id, block_nums));
+        }
         Self {
             bitmap: Mutex::new(BitMap::repeat(true, nblocks.get())),
+            chunk_alloc_tables,
             next_avail: AtomicUsize::new(0),
             nblocks,
             is_dirty: AtomicBool::new(false),
@@ -74,6 +88,13 @@ impl AllocTable {
         };
         bitmap.set(hba, false);
 
+        let chunk_id = hba / CHUNK_SIZE;
+        let chunk_hba = hba % CHUNK_SIZE;
+        let chunk = &self.chunk_alloc_tables[chunk_id];
+        chunk
+            .mark_alloc(chunk_hba)
+            .expect("ChunkAllocTable occured out of range error");
+
         self.next_avail.store(hba + 1, Ordering::Release);
         Some(hba as Hba)
     }
@@ -91,6 +112,16 @@ impl AllocTable {
 
         let hbas = self.do_alloc_batch(count).unwrap();
         debug_assert_eq!(hbas.len(), cnt);
+
+        // Mark hbas alloction in ChunkAllocTable
+        hbas.iter().for_each(|hba| {
+            let chunk_id = *hba / CHUNK_SIZE;
+            let chunk_hba = *hba % CHUNK_SIZE;
+            let chunk = &self.chunk_alloc_tables[chunk_id];
+            chunk
+                .mark_alloc(chunk_hba)
+                .expect("ChunkAllocTable occured out of range error");
+        });
 
         *num_free -= cnt;
         let _ = self
@@ -155,8 +186,10 @@ impl AllocTable {
             {
                 let next_avail = bitmap.first_one(0).unwrap_or(0);
                 let num_free = bitmap.count_ones();
+                // TODO: persistent chunk_alloc_table and recover from it
                 return Ok(Self {
                     bitmap: Mutex::new(bitmap),
+                    chunk_alloc_tables: Vec::new(),
                     next_avail: AtomicUsize::new(next_avail),
                     nblocks,
                     is_dirty: AtomicBool::new(false),
@@ -198,9 +231,10 @@ impl AllocTable {
             }
             let next_avail = bitmap.first_one(0).unwrap_or(0);
             let num_free = bitmap.count_ones();
-
+            // TODO: persistent chunk_alloc_table and recover from it
             Ok(Self {
                 bitmap: Mutex::new(bitmap),
+                chunk_alloc_tables: Vec::new(),
                 next_avail: AtomicUsize::new(next_avail),
                 nblocks,
                 is_dirty: AtomicBool::new(false),

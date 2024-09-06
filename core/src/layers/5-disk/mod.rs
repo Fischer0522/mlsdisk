@@ -33,6 +33,7 @@
 
 mod bio;
 mod block_alloc;
+mod chunk_alloc;
 mod data_buf;
 mod sworndisk;
 
