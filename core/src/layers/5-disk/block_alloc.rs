@@ -60,7 +60,12 @@ impl AllocTable {
             let block_nums = if id < chunk_nums - 1 {
                 CHUNK_SIZE
             } else {
-                total_blocks % CHUNK_SIZE
+                let remainder = total_blocks % CHUNK_SIZE;
+                if remainder == 0 {
+                    CHUNK_SIZE
+                } else {
+                    remainder
+                }
             };
             chunk_alloc_tables.push(ChunkAllocTable::new(id, block_nums));
         }
@@ -414,6 +419,10 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
             alloc_table.cvar.notify_one();
         }
     }
+
+    pub fn get_chunk_alloc_table_ref(&self) -> &[ChunkAllocTable] {
+        self.alloc_table.chunk_alloc_tables.as_ref()
+    }
 }
 
 impl From<u8> for AllocDiff {
@@ -423,5 +432,47 @@ impl From<u8> for AllocDiff {
             7 => AllocDiff::Dealloc,
             _ => AllocDiff::Invalid,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::layers::disk::{block_alloc::AllocTable, chunk_alloc::CHUNK_SIZE};
+    use core::num::NonZeroUsize;
+
+    #[test]
+    fn test_alloc_table() {
+        let alloc_table = AllocTable::new(NonZeroUsize::new(1024).unwrap());
+        assert_eq!(alloc_table.alloc(), Some(0));
+        assert_eq!(alloc_table.alloc(), Some(1));
+        assert!(alloc_table.chunk_alloc_tables[0].num_valid_blocks() == 2);
+    }
+
+    #[test]
+    fn test_alloc_table_batch() {
+        let alloc_table = AllocTable::new(NonZeroUsize::new(1024).unwrap());
+        let hbas = alloc_table
+            .alloc_batch(NonZeroUsize::new(1024).unwrap())
+            .unwrap();
+        assert_eq!(hbas.len(), 1024);
+        assert!(alloc_table.chunk_alloc_tables[0].num_valid_blocks() == 1024);
+
+        let alloc_table = AllocTable::new(NonZeroUsize::new(4 * CHUNK_SIZE).unwrap());
+        let hbas = alloc_table
+            .alloc_batch(NonZeroUsize::new(CHUNK_SIZE + 2).unwrap())
+            .unwrap();
+        assert_eq!(hbas.len(), 1026);
+        assert!(alloc_table.chunk_alloc_tables[0].num_valid_blocks() == 1024);
+        assert!(alloc_table.chunk_alloc_tables[1].num_valid_blocks() == 2);
+
+        let alloc_table = AllocTable::new(NonZeroUsize::new(200 * CHUNK_SIZE).unwrap());
+        let hbas = alloc_table
+            .alloc_batch(NonZeroUsize::new(100 * CHUNK_SIZE + 2).unwrap())
+            .unwrap();
+        assert_eq!(hbas.len(), 100 * CHUNK_SIZE + 2);
+        for chunk_id in 0..100 {
+            assert!(alloc_table.chunk_alloc_tables[chunk_id].num_valid_blocks() == CHUNK_SIZE);
+        }
+        assert!(alloc_table.chunk_alloc_tables[100].num_valid_blocks() == 2);
     }
 }

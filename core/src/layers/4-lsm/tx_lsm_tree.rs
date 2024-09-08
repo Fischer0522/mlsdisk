@@ -28,10 +28,12 @@ pub type SyncId = u64;
 ///
 /// Supports inserting and querying key-value records within transactions.
 /// Supports user-defined callbacks in `MemTable`, during compaction and recovery.
+///
+
 pub struct TxLsmTree<K: RecordKey<K>, V, D>(Arc<TreeInner<K, V, D>>);
 
 /// Inner structures of `TxLsmTree`.
-pub(super) struct TreeInner<K: RecordKey<K>, V, D> {
+struct TreeInner<K: RecordKey<K>, V, D> {
     memtable_manager: MemTableManager<K, V>,
     sst_manager: RwLock<SstManager<K, V>>,
     wal_append_tx: WalAppendTx<D>,
@@ -762,6 +764,12 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> Debug for TreeInner
             .field("sst_manager", &self.sst_manager.read())
             .field("tx_log_store", &self.tx_log_store)
             .finish()
+    }
+}
+
+impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> Clone for TxLsmTree<K, V, D> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
     }
 }
 

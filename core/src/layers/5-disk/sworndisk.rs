@@ -10,7 +10,9 @@
 use super::bio::{BioReq, BioReqQueue, BioResp, BioType};
 use super::block_alloc::{AllocTable, BlockAlloc};
 use super::data_buf::DataBuf;
+use super::gc::{GcWorker, VictimPolicy, VictimPolicyRef};
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
+use crate::layers::disk::gc::GreedyVictimPolicy;
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
     AsKV, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, SyncIdStore,
@@ -24,6 +26,7 @@ use core::num::NonZeroUsize;
 use core::ops::{Add, Sub};
 use core::sync::atomic::{AtomicBool, Ordering};
 use pod::Pod;
+use std::thread;
 
 /// Logical Block Address.
 pub type Lba = BlockId;
@@ -42,7 +45,7 @@ struct DiskInner<D: BlockSet> {
     /// A `TxLsmTree` to store metadata of the logical blocks.
     logical_block_table: TxLsmTree<RecordKey, RecordValue, D>,
     /// The underlying disk where user data is stored.
-    user_data_disk: D,
+    user_data_disk: Arc<D>,
     /// Manage space of the data disk.
     block_validity_table: Arc<AllocTable>,
     /// TX log store for managing logs in `TxLsmTree` and block alloc logs.
@@ -135,20 +138,21 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 sync_id_store,
             )?
         };
+        let inner = Arc::new(DiskInner {
+            bio_req_queue: BioReqQueue::new(),
+            logical_block_table,
+            user_data_disk: Arc::new(data_disk),
+            block_validity_table,
+            tx_log_store,
+            data_buf: DataBuf::new(DATA_BUF_CAP),
+            root_key,
+            is_dropped: AtomicBool::new(false),
+            write_sync_region: RwLock::new(()),
+        });
 
-        let new_self = Self {
-            inner: Arc::new(DiskInner {
-                bio_req_queue: BioReqQueue::new(),
-                logical_block_table,
-                user_data_disk: data_disk,
-                block_validity_table,
-                tx_log_store,
-                data_buf: DataBuf::new(DATA_BUF_CAP),
-                root_key,
-                is_dropped: AtomicBool::new(false),
-                write_sync_region: RwLock::new(()),
-            }),
-        };
+        let gc_worker = Arc::new(inner.create_gc_worker(Arc::new(GreedyVictimPolicy))?);
+
+        let new_self = Self { inner };
 
         #[cfg(not(feature = "linux"))]
         info!("[SwornDisk] Created successfully! {:?}", &new_self);
@@ -160,6 +164,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     pub fn open(
         disk: D,
         root_key: Key,
+        victim_policy_ref: Option<VictimPolicyRef>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
     ) -> Result<Self> {
         let data_disk = Self::subdisk_for_data(&disk)?;
@@ -189,19 +194,28 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             )?
         };
 
-        let opened_self = Self {
-            inner: Arc::new(DiskInner {
-                bio_req_queue: BioReqQueue::new(),
-                logical_block_table,
-                user_data_disk: data_disk,
-                block_validity_table,
-                data_buf: DataBuf::new(DATA_BUF_CAP),
-                tx_log_store,
-                root_key,
-                is_dropped: AtomicBool::new(false),
-                write_sync_region: RwLock::new(()),
-            }),
+        let inner = Arc::new(DiskInner {
+            bio_req_queue: BioReqQueue::new(),
+            logical_block_table,
+            user_data_disk: Arc::new(data_disk),
+            block_validity_table,
+            data_buf: DataBuf::new(DATA_BUF_CAP),
+            tx_log_store,
+            root_key,
+            is_dropped: AtomicBool::new(false),
+            write_sync_region: RwLock::new(()),
+        });
+
+        let gc_worker = match victim_policy_ref {
+            Some(policy_ref) => inner.create_gc_worker(policy_ref)?,
+            None => {
+                // use GreedyVictimPolicy by default
+                let policy = Arc::new(GreedyVictimPolicy);
+                inner.create_gc_worker(policy)?
+            }
         };
+
+        let opened_self = Self { inner };
 
         #[cfg(not(feature = "linux"))]
         info!("[SwornDisk] Opened successfully! {:?}", &opened_self);
@@ -233,6 +247,15 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
     fn subdisk_for_logical_block_table(disk: &D) -> Result<D> {
         disk.subset(disk.nblocks() * 15 / 16..disk.nblocks()) // TBD
+    }
+
+    // Create a gc worker but not launch, just for test
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    pub fn create_gc_worker(&self, policy_ref: VictimPolicyRef) -> Result<GcWorker<D>> {
+        use super::gc::VictimPolicyRef;
+
+        self.inner.create_gc_worker(policy_ref)
     }
 }
 
@@ -471,6 +494,21 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
         req.complete(res.clone());
         res
+    }
+
+    pub fn create_gc_worker(&self, policy_ref: VictimPolicyRef) -> Result<GcWorker<D>> {
+        let block_alloc = Arc::new(BlockAlloc::new(
+            Arc::clone(&self.block_validity_table),
+            Arc::clone(&self.tx_log_store),
+        ));
+        let logical_block_table = self.logical_block_table.clone();
+        let gc_worker = GcWorker::new(
+            policy_ref,
+            logical_block_table,
+            block_alloc,
+            Arc::clone(&self.user_data_disk),
+        );
+        Ok(gc_worker)
     }
 
     /// Handle a read I/O request.
@@ -843,7 +881,7 @@ mod tests {
         // Open the closed `SwornDisk` then test its data's existence
         drop(sworndisk);
         thread::spawn(move || -> Result<()> {
-            let opened_sworndisk = SwornDisk::open(mem_disk, root_key, None)?;
+            let opened_sworndisk = SwornDisk::open(mem_disk, root_key, None, None)?;
             let mut rbuf = Buf::alloc(2)?;
             opened_sworndisk.read(5 as Lba, rbuf.as_mut())?;
             assert_eq!(rbuf.as_slice()[0], 5u8);
