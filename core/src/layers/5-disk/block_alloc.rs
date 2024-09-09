@@ -1,5 +1,5 @@
 //! Block allocation.
-use super::chunk_alloc::{ChunkAllocTable, CHUNK_SIZE};
+use super::chunk_alloc::{ChunkInfo, CHUNK_SIZE};
 use super::sworndisk::Hba;
 use crate::layers::bio::{BlockSet, Buf, BufRef, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogStore};
@@ -22,7 +22,7 @@ const BUCKET_BLOCK_ALLOC_LOG: &str = "BAL";
 /// which manages validities of user data blocks.
 pub(super) struct AllocTable {
     bitmap: Mutex<BitMap>,
-    chunk_alloc_tables: Vec<ChunkAllocTable>,
+    chunk_info_table: Vec<ChunkInfo>,
     next_avail: AtomicUsize,
     nblocks: NonZeroUsize,
     is_dirty: AtomicBool,
@@ -67,11 +67,11 @@ impl AllocTable {
                     remainder
                 }
             };
-            chunk_alloc_tables.push(ChunkAllocTable::new(id, block_nums));
+            chunk_alloc_tables.push(ChunkInfo::new(id, block_nums));
         }
         Self {
             bitmap: Mutex::new(BitMap::repeat(true, nblocks.get())),
-            chunk_alloc_tables,
+            chunk_info_table: chunk_alloc_tables,
             next_avail: AtomicUsize::new(0),
             nblocks,
             is_dirty: AtomicBool::new(false),
@@ -95,10 +95,10 @@ impl AllocTable {
 
         let chunk_id = hba / CHUNK_SIZE;
         let chunk_hba = hba % CHUNK_SIZE;
-        let chunk = &self.chunk_alloc_tables[chunk_id];
+        let chunk = &self.chunk_info_table[chunk_id];
         chunk
             .mark_alloc(chunk_hba)
-            .expect("ChunkAllocTable occured out of range error");
+            .expect("Chunk allocation should be in range");
 
         self.next_avail.store(hba + 1, Ordering::Release);
         Some(hba as Hba)
@@ -118,11 +118,11 @@ impl AllocTable {
         let hbas = self.do_alloc_batch(count).unwrap();
         debug_assert_eq!(hbas.len(), cnt);
 
-        // Mark hbas alloction in ChunkAllocTable
+        // Mark hbas allocation in ChunkAllocTable
         hbas.iter().for_each(|hba| {
             let chunk_id = *hba / CHUNK_SIZE;
             let chunk_hba = *hba % CHUNK_SIZE;
-            let chunk = &self.chunk_alloc_tables[chunk_id];
+            let chunk = &self.chunk_info_table[chunk_id];
             chunk
                 .mark_alloc(chunk_hba)
                 .expect("ChunkAllocTable occured out of range error");
@@ -194,7 +194,7 @@ impl AllocTable {
                 // TODO: persistent chunk_alloc_table and recover from it
                 return Ok(Self {
                     bitmap: Mutex::new(bitmap),
-                    chunk_alloc_tables: Vec::new(),
+                    chunk_info_table: Vec::new(),
                     next_avail: AtomicUsize::new(next_avail),
                     nblocks,
                     is_dirty: AtomicBool::new(false),
@@ -239,7 +239,7 @@ impl AllocTable {
             // TODO: persistent chunk_alloc_table and recover from it
             Ok(Self {
                 bitmap: Mutex::new(bitmap),
-                chunk_alloc_tables: Vec::new(),
+                chunk_info_table: Vec::new(),
                 next_avail: AtomicUsize::new(next_avail),
                 nblocks,
                 is_dirty: AtomicBool::new(false),
@@ -307,11 +307,23 @@ impl AllocTable {
         let mut num_free = self.num_free.lock().unwrap();
         self.bitmap.lock().set(nth, true);
 
+        let chunk_id = nth / CHUNK_SIZE;
+        let chunk_offset = nth % CHUNK_SIZE;
+
+        // TODO: remove this panic?
+        self.chunk_info_table[chunk_id]
+            .mark_deallocated(chunk_offset)
+            .expect("Chunk deallocation should be in range");
+
         *num_free += 1;
         const AVG_ALLOC_COUNT: usize = 1024;
         if *num_free >= AVG_ALLOC_COUNT {
             self.cvar.notify_one();
         }
+    }
+
+    pub fn get_chunk_info_table_ref(&self) -> &[ChunkInfo] {
+        &self.chunk_info_table
     }
 }
 
@@ -419,10 +431,6 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
             alloc_table.cvar.notify_one();
         }
     }
-
-    pub fn get_chunk_alloc_table_ref(&self) -> &[ChunkAllocTable] {
-        self.alloc_table.chunk_alloc_tables.as_ref()
-    }
 }
 
 impl From<u8> for AllocDiff {
@@ -445,7 +453,15 @@ mod tests {
         let alloc_table = AllocTable::new(NonZeroUsize::new(1024).unwrap());
         assert_eq!(alloc_table.alloc(), Some(0));
         assert_eq!(alloc_table.alloc(), Some(1));
-        assert!(alloc_table.chunk_alloc_tables[0].num_valid_blocks() == 2);
+        assert_eq!(alloc_table.chunk_info_table[0].num_valid_blocks(), 1024);
+        assert_eq!(alloc_table.chunk_info_table[0].free_space(), 1022);
+
+        alloc_table.set_deallocated(0);
+        assert_eq!(alloc_table.chunk_info_table[0].num_valid_blocks(), 1023);
+        assert_eq!(alloc_table.chunk_info_table[0].free_space(), 1023);
+        alloc_table.set_deallocated(1);
+        assert_eq!(alloc_table.chunk_info_table[0].num_valid_blocks(), 1022);
+        assert_eq!(alloc_table.chunk_info_table[0].free_space(), 1024);
     }
 
     #[test]
@@ -455,15 +471,22 @@ mod tests {
             .alloc_batch(NonZeroUsize::new(1024).unwrap())
             .unwrap();
         assert_eq!(hbas.len(), 1024);
-        assert!(alloc_table.chunk_alloc_tables[0].num_valid_blocks() == 1024);
+        assert!(alloc_table.chunk_info_table[0].num_valid_blocks() == 1024);
+        assert_eq!(alloc_table.chunk_info_table[0].free_space(), 0);
 
         let alloc_table = AllocTable::new(NonZeroUsize::new(4 * CHUNK_SIZE).unwrap());
         let hbas = alloc_table
             .alloc_batch(NonZeroUsize::new(CHUNK_SIZE + 2).unwrap())
             .unwrap();
         assert_eq!(hbas.len(), 1026);
-        assert!(alloc_table.chunk_alloc_tables[0].num_valid_blocks() == 1024);
-        assert!(alloc_table.chunk_alloc_tables[1].num_valid_blocks() == 2);
+        assert_eq!(alloc_table.chunk_info_table[0].num_valid_blocks(), 1024);
+        assert_eq!(alloc_table.chunk_info_table[1].num_valid_blocks(), 1024);
+        assert_eq!(alloc_table.chunk_info_table[0].free_space(), 0);
+        assert_eq!(alloc_table.chunk_info_table[1].free_space(), 1022);
+
+        alloc_table.set_deallocated(1024);
+        assert_eq!(alloc_table.chunk_info_table[1].num_valid_blocks(), 1023);
+        assert_eq!(alloc_table.chunk_info_table[1].free_space(), 1023);
 
         let alloc_table = AllocTable::new(NonZeroUsize::new(200 * CHUNK_SIZE).unwrap());
         let hbas = alloc_table
@@ -471,8 +494,13 @@ mod tests {
             .unwrap();
         assert_eq!(hbas.len(), 100 * CHUNK_SIZE + 2);
         for chunk_id in 0..100 {
-            assert!(alloc_table.chunk_alloc_tables[chunk_id].num_valid_blocks() == CHUNK_SIZE);
+            assert_eq!(
+                alloc_table.chunk_info_table[chunk_id].num_valid_blocks(),
+                CHUNK_SIZE
+            );
+            assert_eq!(alloc_table.chunk_info_table[chunk_id].free_space(), 0);
         }
-        assert!(alloc_table.chunk_alloc_tables[100].num_valid_blocks() == 2);
+        assert_eq!(alloc_table.chunk_info_table[100].num_valid_blocks(), 1024);
+        assert_eq!(alloc_table.chunk_info_table[100].free_space(), 1022);
     }
 }

@@ -151,6 +151,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         });
 
         let gc_worker = Arc::new(inner.create_gc_worker(Arc::new(GreedyVictimPolicy))?);
+        thread::spawn(move || gc_worker.run());
 
         let new_self = Self { inner };
 
@@ -214,6 +215,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 inner.create_gc_worker(policy)?
             }
         };
+        thread::spawn(move || gc_worker.background_gc());
 
         let opened_self = Self { inner };
 
@@ -497,16 +499,13 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     }
 
     pub fn create_gc_worker(&self, policy_ref: VictimPolicyRef) -> Result<GcWorker<D>> {
-        let block_alloc = Arc::new(BlockAlloc::new(
-            Arc::clone(&self.block_validity_table),
-            Arc::clone(&self.tx_log_store),
-        ));
         let logical_block_table = self.logical_block_table.clone();
         let gc_worker = GcWorker::new(
             policy_ref,
             logical_block_table,
-            block_alloc,
-            Arc::clone(&self.user_data_disk),
+            self.tx_log_store.clone(),
+            self.block_validity_table.clone(),
+            self.user_data_disk.clone(),
         );
         Ok(gc_worker)
     }

@@ -79,7 +79,7 @@ fn run_benches(benches: Vec<Box<dyn Bench>>) {
     let mut failed_count = 0;
     for b in benches {
         print!("bench {} ... ", &b);
-        b.prepare();
+        let _ = b.prepare();
 
         let start = Instant::now();
         let res = b.run();
