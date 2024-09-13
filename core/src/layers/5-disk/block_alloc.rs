@@ -21,7 +21,7 @@ const BUCKET_BLOCK_ALLOC_LOG: &str = "BAL";
 /// Block validity table. Global allocator for `SwornDisk`,
 /// which manages validities of user data blocks.
 pub(super) struct AllocTable {
-    bitmap: Mutex<BitMap>,
+    bitmap: Arc<Mutex<BitMap>>,
     chunk_info_table: Vec<ChunkInfo>,
     next_avail: AtomicUsize,
     nblocks: NonZeroUsize,
@@ -56,6 +56,7 @@ impl AllocTable {
         let total_blocks = nblocks.get();
         let chunk_nums = total_blocks / CHUNK_SIZE;
         let mut chunk_alloc_tables = Vec::with_capacity(chunk_nums);
+        let bitmap = Arc::new(Mutex::new(BitMap::repeat(true, nblocks.get())));
         for id in 0..chunk_nums {
             let block_nums = if id < chunk_nums - 1 {
                 CHUNK_SIZE
@@ -67,10 +68,10 @@ impl AllocTable {
                     remainder
                 }
             };
-            chunk_alloc_tables.push(ChunkInfo::new(id, block_nums));
+            chunk_alloc_tables.push(ChunkInfo::new(id, block_nums, bitmap.clone()));
         }
         Self {
-            bitmap: Mutex::new(BitMap::repeat(true, nblocks.get())),
+            bitmap,
             chunk_info_table: chunk_alloc_tables,
             next_avail: AtomicUsize::new(0),
             nblocks,
@@ -94,11 +95,7 @@ impl AllocTable {
         bitmap.set(hba, false);
 
         let chunk_id = hba / CHUNK_SIZE;
-        let chunk_hba = hba % CHUNK_SIZE;
-        let chunk = &self.chunk_info_table[chunk_id];
-        chunk
-            .mark_alloc(chunk_hba)
-            .expect("Chunk allocation should be in range");
+        self.chunk_info_table[chunk_id].mark_alloc();
 
         self.next_avail.store(hba + 1, Ordering::Release);
         Some(hba as Hba)
@@ -121,11 +118,7 @@ impl AllocTable {
         // Mark hbas allocation in ChunkAllocTable
         hbas.iter().for_each(|hba| {
             let chunk_id = *hba / CHUNK_SIZE;
-            let chunk_hba = *hba % CHUNK_SIZE;
-            let chunk = &self.chunk_info_table[chunk_id];
-            chunk
-                .mark_alloc(chunk_hba)
-                .expect("ChunkAllocTable occured out of range error");
+            self.chunk_info_table[chunk_id].mark_alloc();
         });
 
         *num_free -= cnt;
@@ -193,7 +186,7 @@ impl AllocTable {
                 let num_free = bitmap.count_ones();
                 // TODO: persistent chunk_alloc_table and recover from it
                 return Ok(Self {
-                    bitmap: Mutex::new(bitmap),
+                    bitmap: Arc::new(Mutex::new(bitmap)),
                     chunk_info_table: Vec::new(),
                     next_avail: AtomicUsize::new(next_avail),
                     nblocks,
@@ -236,9 +229,9 @@ impl AllocTable {
             }
             let next_avail = bitmap.first_one(0).unwrap_or(0);
             let num_free = bitmap.count_ones();
-            // TODO: persistent chunk_alloc_table and recover from it
+            // TODO: persistent chunk_info_table and recover from it
             Ok(Self {
-                bitmap: Mutex::new(bitmap),
+                bitmap: Arc::new(Mutex::new(bitmap)),
                 chunk_info_table: Vec::new(),
                 next_avail: AtomicUsize::new(next_avail),
                 nblocks,
@@ -308,12 +301,8 @@ impl AllocTable {
         self.bitmap.lock().set(nth, true);
 
         let chunk_id = nth / CHUNK_SIZE;
-        let chunk_offset = nth % CHUNK_SIZE;
-
         // TODO: remove this panic?
-        self.chunk_info_table[chunk_id]
-            .mark_deallocated(chunk_offset)
-            .expect("Chunk deallocation should be in range");
+        self.chunk_info_table[chunk_id].mark_deallocated();
 
         *num_free += 1;
         const AVG_ALLOC_COUNT: usize = 1024;

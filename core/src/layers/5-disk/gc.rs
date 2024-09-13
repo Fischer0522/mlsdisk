@@ -14,7 +14,7 @@ use crate::{
     Buf, BLOCK_SIZE,
 };
 use core::{
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     time::Duration,
     usize,
 };
@@ -63,6 +63,32 @@ impl VictimPolicy for GreedyVictimPolicy {
             victim.blocks = victim_chunk.find_all_allocated_blocks();
             victim
         })
+    }
+}
+
+pub struct LoopScanVictimPolicy {
+    cursor: AtomicUsize,
+}
+
+impl VictimPolicy for LoopScanVictimPolicy {
+    fn pick_victim(&self, chunk_info_tables: &[ChunkInfo], threshold: f64) -> Option<Victim> {
+        let last_cursor = self.cursor.load(Ordering::Relaxed);
+        let mut cursor = last_cursor;
+        loop {
+            cursor = (cursor + 1) % chunk_info_tables.len();
+            if cursor == last_cursor {
+                return None;
+            }
+            let chunk = &chunk_info_tables[cursor];
+            let invalid_block_fraction = chunk.num_invalid_blocks() as f64 / chunk.nblocks() as f64;
+            if invalid_block_fraction > threshold {
+                self.cursor.store(cursor, Ordering::Release);
+                return Some(Victim {
+                    chunk_id: cursor,
+                    blocks: chunk.find_all_allocated_blocks(),
+                });
+            }
+        }
     }
 }
 
@@ -128,6 +154,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
                 self.block_validity_table.get_chunk_info_table_ref(),
                 DEFAULT_GC_THRESHOLD,
             );
+
             // Generally, the VictimPolicy will pick a victim chunk that most needs GC
             // if it returned None, it means there is no chunk needs GC, we can return
             let Some(victim) = victim else {
@@ -204,6 +231,8 @@ impl<D: BlockSet + 'static> GcWorker<D> {
 
 #[cfg(test)]
 mod tests {
+    use spin::Mutex;
+
     use super::*;
     use crate::{
         layers::{
@@ -217,6 +246,7 @@ mod tests {
             lsm::{AsKV, SyncIdStore, TxEventListener, TxEventListenerFactory, TxLsmTree, TxType},
         },
         tx::Tx,
+        util::BitMap,
         AeadKey, RandomInit, SwornDisk,
     };
     use core::num::NonZeroUsize;
@@ -224,27 +254,29 @@ mod tests {
 
     #[test]
     fn greedy_victim_policy_test() {
+        let bitmap = Arc::new(Mutex::new(BitMap::repeat(true, 3 * 1024)));
         let chunk_alloc_tables = vec![
-            ChunkInfo::new(0, 1024),
-            ChunkInfo::new(1, 1024),
-            ChunkInfo::new(2, 1024),
+            ChunkInfo::new(0, 1024, bitmap.clone()),
+            ChunkInfo::new(1, 1024, bitmap.clone()),
+            ChunkInfo::new(2, 1024, bitmap.clone()),
         ];
         let policy = GreedyVictimPolicy {};
         let victim = policy.pick_victim(&chunk_alloc_tables, 0.);
         assert!(victim.is_none());
-        chunk_alloc_tables[1].mark_alloc(0).unwrap();
+        chunk_alloc_tables[1].mark_alloc();
         // After dealloc, there will be an invalid block in the chunk, chunk 1 will be the victim
-        chunk_alloc_tables[1].mark_deallocated(0).unwrap();
+        chunk_alloc_tables[1].mark_deallocated();
         let victim = policy.pick_victim(&chunk_alloc_tables, 0.);
         assert_eq!(victim.unwrap().chunk_id, 1);
     }
 
     #[test]
     fn threshold_test() {
+        let bitmap = Arc::new(Mutex::new(BitMap::repeat(true, 3 * 1024)));
         let chunk_alloc_tables = vec![
-            ChunkInfo::new(0, 1024),
-            ChunkInfo::new(1, 1024),
-            ChunkInfo::new(2, 1024),
+            ChunkInfo::new(0, 1024, bitmap.clone()),
+            ChunkInfo::new(1, 1024, bitmap.clone()),
+            ChunkInfo::new(2, 1024, bitmap.clone()),
         ];
         let policy = GreedyVictimPolicy {};
         let threshold = 0.2;
@@ -252,12 +284,17 @@ mod tests {
         assert!(victim.is_none());
 
         // deallocate enough blocks to pick the chunk as victim
-        for i in 0..((2 * CHUNK_SIZE) as f64 * threshold) as usize {
-            chunk_alloc_tables[1].mark_alloc(i).unwrap();
-            chunk_alloc_tables[1].mark_deallocated(i).unwrap();
+        for _ in 0..((2 * CHUNK_SIZE) as f64 * threshold) as usize {
+            chunk_alloc_tables[1].mark_alloc();
+            chunk_alloc_tables[1].mark_deallocated();
         }
         let victim = policy.pick_victim(&chunk_alloc_tables, threshold);
         assert_eq!(victim.unwrap().chunk_id, 1);
+    }
+
+    #[test]
+    fn find_free_blocks() {
+        todo!()
     }
 
     #[test]
