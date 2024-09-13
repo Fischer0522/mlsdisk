@@ -109,6 +109,8 @@ pub struct ChunkAlloc {}
 
 #[cfg(test)]
 mod tests {
+    use hashbrown::HashSet;
+
     use super::*;
 
     #[test]
@@ -129,5 +131,51 @@ mod tests {
         chunk_alloc_table.mark_deallocated();
         assert_eq!(chunk_alloc_table.num_valid_blocks(), 1023);
         assert_eq!(chunk_alloc_table.free_space(), 1015);
+    }
+
+    #[test]
+    fn find_free_blocks() {
+        let bitmap = Arc::new(Mutex::new(BitMap::repeat(true, 3 * 1024)));
+        {
+            let mut guard = bitmap.lock();
+            guard.set(0, false);
+            guard.set(1, false);
+
+            guard.set(1024, false);
+            guard.set(1025, false);
+            guard.set(1026, false);
+        }
+
+        let chunk_alloc_tables = vec![
+            ChunkInfo::new(0, 1024, bitmap.clone()),
+            ChunkInfo::new(1, 1024, bitmap.clone()),
+            ChunkInfo::new(2, 1024, bitmap.clone()),
+        ];
+
+        assert_eq!(chunk_alloc_tables[0].find_all_free_blocks().len(), 1022);
+        assert_eq!(chunk_alloc_tables[1].find_all_free_blocks().len(), 1021);
+        assert_eq!(chunk_alloc_tables[2].find_all_free_blocks().len(), 1024);
+
+        let free_set0: HashSet<Hba> = chunk_alloc_tables[0]
+            .find_all_free_blocks()
+            .into_iter()
+            .collect();
+        let free_set1: HashSet<Hba> = chunk_alloc_tables[1]
+            .find_all_free_blocks()
+            .into_iter()
+            .collect();
+        let free_set2: HashSet<Hba> = chunk_alloc_tables[2]
+            .find_all_free_blocks()
+            .into_iter()
+            .collect();
+        assert_eq!(free_set0.len(), 1022);
+        assert_eq!(free_set1.len(), 1021);
+        assert_eq!(free_set2.len(), 1024);
+        assert!(!free_set0.contains(&0));
+        assert!(!free_set0.contains(&1));
+
+        assert!(!free_set1.contains(&1024));
+        assert!(!free_set1.contains(&1025));
+        assert!(!free_set1.contains(&1026));
     }
 }

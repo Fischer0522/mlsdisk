@@ -293,11 +293,6 @@ mod tests {
     }
 
     #[test]
-    fn find_free_blocks() {
-        todo!()
-    }
-
-    #[test]
     fn simple_data_migration() {
         let nblocks = 64 * CHUNK_SIZE;
         let mem_disk = MemDisk::create(nblocks).unwrap();
