@@ -1,10 +1,10 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
-
+use super::block_alloc::{AllocDiff, AllocTable};
 use super::sworndisk::Hba;
-use crate::os::Mutex;
+use crate::layers::log::{TxLog, TxLogStore};
+use crate::os::{BTreeMap, Mutex};
 use crate::util::BitMap;
-use crate::{prelude::*, Errno};
-
+use crate::{prelude::*, BlockSet, Errno};
+use core::sync::atomic::{AtomicUsize, Ordering};
 // Each chunk contains 1024 blocks
 pub const CHUNK_SIZE: usize = 1024;
 pub type ChunkId = usize;
@@ -12,6 +12,7 @@ pub type ChunkId = usize;
 // Currently ChunkAllocTable is not response for Block Alloc, it just records
 // alloced hba and count the number of valid blocks in the chunk, which is used for GC
 
+// Persistent data: ChunkId, valid_block, free_space
 pub struct ChunkInfo {
     chunk_id: ChunkId,
     // valid_block statistic all empty blocks and blocks that have been marked as allocated,
@@ -103,9 +104,18 @@ impl ChunkInfo {
         }
         free_blocks
     }
-}
 
-pub struct ChunkAlloc {}
+    pub fn clear_chunk(&self) {
+        let mut guard = self.bitmap.lock();
+        let lower_bound = self.chunk_id * CHUNK_SIZE;
+        let upper_bound = lower_bound + self.nblocks;
+        for idx in lower_bound..upper_bound {
+            guard.set(idx, true);
+        }
+        self.valid_block.store(self.nblocks, Ordering::Release);
+        self.free_space.store(self.nblocks, Ordering::Release);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -134,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn find_free_blocks() {
+    fn find_free_and_allocated_blocks() {
         let bitmap = Arc::new(Mutex::new(BitMap::repeat(true, 3 * 1024)));
         {
             let mut guard = bitmap.lock();
@@ -177,5 +187,9 @@ mod tests {
         assert!(!free_set1.contains(&1024));
         assert!(!free_set1.contains(&1025));
         assert!(!free_set1.contains(&1026));
+
+        assert_eq!(chunk_alloc_tables[0].find_all_allocated_blocks().len(), 2);
+        assert_eq!(chunk_alloc_tables[1].find_all_allocated_blocks().len(), 3);
+        assert_eq!(chunk_alloc_tables[2].find_all_allocated_blocks().len(), 0);
     }
 }

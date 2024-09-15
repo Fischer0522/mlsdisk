@@ -36,6 +36,7 @@ mod block_alloc;
 mod chunk_alloc;
 mod data_buf;
 mod gc;
+mod reverse_index;
 mod sworndisk;
 
 pub use self::sworndisk::SwornDisk;

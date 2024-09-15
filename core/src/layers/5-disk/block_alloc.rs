@@ -43,12 +43,17 @@ pub(super) struct BlockAlloc<D> {
 /// Incremental diff of block validity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
-enum AllocDiff {
+pub(super) enum AllocDiff {
     Alloc = 3,
     Dealloc = 7,
     Invalid,
 }
 const DIFF_RECORD_SIZE: usize = size_of::<AllocDiff>() + size_of::<Hba>();
+
+pub(super) enum AllocStatus {
+    Compaction,
+    Gc,
+}
 
 impl AllocTable {
     /// Create a new `AllocTable` given the total number of blocks.
@@ -295,6 +300,14 @@ impl AllocTable {
         Ok(())
     }
 
+    pub fn set_allocated(&self, nth: usize) {
+        let mut num_free = self.num_free.lock().unwrap();
+        self.bitmap.lock().set(nth, false);
+        let chunk_id = nth / CHUNK_SIZE;
+        self.chunk_info_table[chunk_id].mark_alloc();
+        *num_free -= 1;
+    }
+
     /// Mark a specific slot deallocated.
     pub fn set_deallocated(&self, nth: usize) {
         let mut num_free = self.num_free.lock().unwrap();
@@ -393,18 +406,26 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
     }
 
     /// Update the metadata in diff table to the in-memory block validity table.
-    pub fn update_alloc_table(&self) {
+    pub fn update_alloc_table(&self, status: AllocStatus) {
         let diff_table = self.diff_table.lock();
         let alloc_table = &self.alloc_table;
         let mut num_free = alloc_table.num_free.lock().unwrap();
         let mut bitmap = alloc_table.bitmap.lock();
         let mut num_dealloc = 0_usize;
-
+        let mut num_alloc = 0_usize;
         for (block_id, block_diff) in diff_table.iter() {
             match block_diff {
-                AllocDiff::Alloc => {
-                    debug_assert!(!bitmap[*block_id]);
-                }
+                AllocDiff::Alloc => match status {
+                    AllocStatus::Compaction => {
+                        debug_assert!(!bitmap[*block_id]);
+                    }
+                    AllocStatus::Gc => {
+                        debug_assert!(bitmap[*block_id]);
+                        bitmap.set(*block_id, false);
+
+                        num_alloc += 1;
+                    }
+                },
                 AllocDiff::Dealloc => {
                     debug_assert!(!bitmap[*block_id]);
                     bitmap.set(*block_id, true);
@@ -415,6 +436,7 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
         }
 
         *num_free += num_dealloc;
+        *num_free -= num_alloc;
         const AVG_ALLOC_COUNT: usize = 1024;
         if *num_free >= AVG_ALLOC_COUNT {
             alloc_table.cvar.notify_one();

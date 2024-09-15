@@ -8,9 +8,10 @@
 //! allocation metadata. `TxLsmTree` and `BlockAlloc` are manipulated
 //! based on internal transactions.
 use super::bio::{BioReq, BioReqQueue, BioResp, BioType};
-use super::block_alloc::{AllocTable, BlockAlloc};
+use super::block_alloc::{AllocStatus, AllocTable, BlockAlloc};
 use super::data_buf::DataBuf;
 use super::gc::{GcWorker, VictimPolicy, VictimPolicyRef};
+use super::reverse_index::ReverseIndexTable;
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
 use crate::layers::disk::gc::GreedyVictimPolicy;
 use crate::layers::log::TxLogStore;
@@ -18,7 +19,7 @@ use crate::layers::lsm::{
     AsKV, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, SyncIdStore,
     TxEventListener, TxEventListenerFactory, TxLsmTree, TxType,
 };
-use crate::os::{Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, RwLock};
+use crate::os::{Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, BTreeMap, RwLock};
 use crate::prelude::*;
 use crate::tx::Tx;
 
@@ -26,6 +27,7 @@ use core::num::NonZeroUsize;
 use core::ops::{Add, Sub};
 use core::sync::atomic::{AtomicBool, Ordering};
 use pod::Pod;
+use spin::Mutex;
 use std::thread;
 
 /// Logical Block Address.
@@ -44,6 +46,8 @@ struct DiskInner<D: BlockSet> {
     bio_req_queue: BioReqQueue,
     /// A `TxLsmTree` to store metadata of the logical blocks.
     logical_block_table: TxLsmTree<RecordKey, RecordValue, D>,
+    /// A reverse index table that map HBA to LBA.
+    reverse_index_table: Arc<ReverseIndexTable>,
     /// The underlying disk where user data is stored.
     user_data_disk: Arc<D>,
     /// Manage space of the data disk.
@@ -141,6 +145,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let inner = Arc::new(DiskInner {
             bio_req_queue: BioReqQueue::new(),
             logical_block_table,
+            reverse_index_table: Arc::new(ReverseIndexTable::new()),
             user_data_disk: Arc::new(data_disk),
             block_validity_table,
             tx_log_store,
@@ -150,7 +155,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             write_sync_region: RwLock::new(()),
         });
 
-        let gc_worker = Arc::new(inner.create_gc_worker(Arc::new(GreedyVictimPolicy))?);
+        let gc_worker = Arc::new(inner.create_gc_worker(Arc::new(GreedyVictimPolicy {}))?);
         thread::spawn(move || gc_worker.run());
 
         let new_self = Self { inner };
@@ -195,9 +200,13 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             )?
         };
 
+        // TODO: Recover RIT from TxLsmTree
+        let reverse_index_table = Arc::new(ReverseIndexTable::new());
+
         let inner = Arc::new(DiskInner {
             bio_req_queue: BioReqQueue::new(),
             logical_block_table,
+            reverse_index_table,
             user_data_disk: Arc::new(data_disk),
             block_validity_table,
             data_buf: DataBuf::new(DATA_BUF_CAP),
@@ -211,11 +220,11 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             Some(policy_ref) => inner.create_gc_worker(policy_ref)?,
             None => {
                 // use GreedyVictimPolicy by default
-                let policy = Arc::new(GreedyVictimPolicy);
+                let policy = Arc::new(GreedyVictimPolicy {});
                 inner.create_gc_worker(policy)?
             }
         };
-        thread::spawn(move || gc_worker.background_gc());
+        thread::spawn(move || gc_worker.run());
 
         let opened_self = Self { inner };
 
@@ -414,11 +423,14 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     fn flush_data_buf(&self) -> Result<()> {
         let records = self.write_blocks_from_data_buf()?;
         // Insert new records of data blocks to `TxLsmTree`
-        for (key, value) in records {
+        for (key, value) in records.iter() {
             // TODO: Error handling: Should dealloc the written blocks
-            self.logical_block_table.put(key, value)?;
+            self.logical_block_table.put(key.clone(), value.clone())?;
         }
 
+        // Update reverse index table
+        self.reverse_index_table
+            .update_index_batch(records.into_iter());
         self.data_buf.clear();
         Ok(())
     }
@@ -499,10 +511,10 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     }
 
     pub fn create_gc_worker(&self, policy_ref: VictimPolicyRef) -> Result<GcWorker<D>> {
-        let logical_block_table = self.logical_block_table.clone();
         let gc_worker = GcWorker::new(
             policy_ref,
-            logical_block_table,
+            self.logical_block_table.clone(),
+            self.reverse_index_table.clone(),
             self.tx_log_store.clone(),
             self.block_validity_table.clone(),
             self.user_data_disk.clone(),
@@ -700,7 +712,9 @@ impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTre
 
     fn on_tx_commit(&self) {
         match self.tx_type {
-            TxType::Compaction { .. } | TxType::Migration => self.block_alloc.update_alloc_table(),
+            TxType::Compaction { .. } | TxType::Migration => {
+                self.block_alloc.update_alloc_table(AllocStatus::Compaction)
+            }
         }
     }
 }

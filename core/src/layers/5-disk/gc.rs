@@ -1,10 +1,13 @@
 use super::{
     block_alloc::{AllocTable, BlockAlloc},
     chunk_alloc::{ChunkId, ChunkInfo},
-    sworndisk::{Hba, RecordKey, RecordValue},
+    reverse_index::ReverseIndexTable,
+    sworndisk::{Hba, Lba, RecordKey, RecordValue},
 };
-use crate::os::Arc;
-use crate::{layers::lsm::TxLsmTree, BlockSet};
+use crate::{
+    layers::{disk::block_alloc::AllocStatus, lsm::TxLsmTree},
+    BlockSet,
+};
 use crate::{
     layers::{
         disk::{bio::BlockBuf, block_alloc},
@@ -13,11 +16,16 @@ use crate::{
     prelude::Result,
     Buf, BLOCK_SIZE,
 };
+use crate::{
+    os::{Arc, BTreeMap, Mutex, Vec},
+    prelude,
+};
 use core::{
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     time::Duration,
     usize,
 };
+use hashbrown::{HashMap, HashSet};
 use log::debug;
 // Default gc interval time is 30 seconds
 const DEFAULT_GC_INTERVAL_TIME: std::time::Duration = std::time::Duration::from_secs(30);
@@ -35,12 +43,12 @@ pub trait VictimPolicy: Send + Sync {
 
 pub type VictimPolicyRef = Arc<dyn VictimPolicy>;
 
-pub struct GreedyVictimPolicy;
+pub struct GreedyVictimPolicy {}
 
 impl VictimPolicy for GreedyVictimPolicy {
     // pick the chunk with the maximum number of invalid blocks
     fn pick_victim(&self, chunk_alloc_tables: &[ChunkInfo], threshold: f64) -> Option<Victim> {
-        let mut max_num_invalid_blocks = usize::MIN;
+        let mut max_num_invalid_blocks = 0;
         let mut victim = None;
         chunk_alloc_tables
             .iter()
@@ -95,6 +103,7 @@ impl VictimPolicy for LoopScanVictimPolicy {
 pub(super) struct GcWorker<D> {
     victim_policy: VictimPolicyRef,
     logical_block_table: TxLsmTree<RecordKey, RecordValue, D>,
+    reverse_index_table: Arc<ReverseIndexTable>,
     block_validity_table: Arc<AllocTable>,
     tx_log_store: Arc<TxLogStore<D>>,
     user_data_disk: Arc<D>,
@@ -105,6 +114,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
     pub fn new(
         victim_policy: VictimPolicyRef,
         logical_block_table: TxLsmTree<RecordKey, RecordValue, D>,
+        reverse_index_table: Arc<ReverseIndexTable>,
         tx_log_store: Arc<TxLogStore<D>>,
         block_validity_table: Arc<AllocTable>,
         user_data_disk: Arc<D>,
@@ -116,6 +126,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             tx_log_store,
             user_data_disk,
             doing_background_gc: AtomicBool::new(false),
+            reverse_index_table,
         }
     }
 
@@ -142,13 +153,15 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             return Ok(());
         }
         // Safety: if victim is none, the function will return early
-        self.clean_and_migrate_data(victim.unwrap())?;
+        let remapped_hbas = self.clean_and_migrate_data(victim.unwrap())?;
+        self.reverse_index_table
+            .remap_index_batch(remapped_hbas, &self.logical_block_table)?;
         Ok(())
     }
 
     // TODO: use tx to migrate data from victim to other chunk and update metadata
     pub fn background_gc(&self) -> Result<()> {
-        let mut chunk_cnt = 0;
+        let mut chunk_ids = Vec::with_capacity(GC_WATERMARK);
         for _ in 0..GC_WATERMARK {
             let victim = self.victim_policy.pick_victim(
                 self.block_validity_table.get_chunk_info_table_ref(),
@@ -160,17 +173,23 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             let Some(victim) = victim else {
                 break;
             };
-            chunk_cnt += 1;
-            self.clean_and_migrate_data(victim)?;
+            chunk_ids.push(victim.chunk_id);
+            let remapped_hbas = self.clean_and_migrate_data(victim)?;
+            self.reverse_index_table
+                .remap_index_batch(remapped_hbas, &self.logical_block_table)?;
         }
-        debug!("Background GC succeed, freed {} chunks", chunk_cnt);
+        debug!(
+            "Background GC succeed, freed {} chunks, chunk_ids: {:?}",
+            chunk_ids.len(),
+            chunk_ids
+        );
         Ok(())
     }
 
-    pub fn clean_and_migrate_data(&self, victim: Victim) -> Result<()> {
+    pub fn clean_and_migrate_data(&self, victim: Victim) -> Result<Vec<(Hba, Hba)>> {
         let victim_chunk = &self.block_validity_table.get_chunk_info_table_ref()[victim.chunk_id];
         // TODO: use tx to migrate data from victim to other chunk ?
-        let victim_hbas = victim_chunk.find_all_allocated_blocks();
+        let victim_hbas = victim.blocks;
         let mut target_hbas = Vec::new();
         let mut found_enough_blocks = false;
         for chunk in self.block_validity_table.get_chunk_info_table_ref() {
@@ -179,11 +198,11 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             }
             let free_hbas = chunk.find_all_free_blocks();
             for hba in free_hbas {
-                target_hbas.push(hba);
                 if target_hbas.len() >= victim_hbas.len() {
                     found_enough_blocks = true;
                     break;
                 }
+                target_hbas.push(hba);
             }
             if found_enough_blocks {
                 break;
@@ -191,7 +210,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         }
         // TODO: use batch to migrate data
 
-        debug_assert!(victim_hbas.len() == target_hbas.len());
+        debug_assert_eq!(victim_hbas.len(), target_hbas.len());
         for (victim_hba, target_hba) in victim_hbas.iter().zip(target_hbas.clone()) {
             let mut victim_block = Buf::alloc(1)?;
             self.user_data_disk
@@ -200,21 +219,17 @@ impl<D: BlockSet + 'static> GcWorker<D> {
                 .write(target_hba, victim_block.as_ref())?;
         }
 
-        let block_alloc =
-            BlockAlloc::new(self.block_validity_table.clone(), self.tx_log_store.clone());
-
         victim_hbas
-            .into_iter()
-            .try_for_each(|hba| block_alloc.dealloc_block(hba))?;
+            .iter()
+            .for_each(|hba| self.block_validity_table.set_deallocated(*hba));
 
         target_hbas
-            .into_iter()
-            .try_for_each(|hba| block_alloc.alloc_block(hba))?;
+            .iter()
+            .for_each(|hba| self.block_validity_table.set_allocated(*hba));
 
-        block_alloc.update_alloc_table();
+        victim_chunk.clear_chunk();
 
-        // TODO: update logical block table
-        todo!()
+        Ok(victim_hbas.into_iter().zip(target_hbas).collect())
     }
 
     fn trigger_gc(&self, victim: Option<&Victim>) -> bool {
@@ -294,6 +309,11 @@ mod tests {
 
     #[test]
     fn simple_data_migration() {
+        env_logger::builder()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Debug)
+            .try_init()
+            .unwrap();
         let nblocks = 64 * CHUNK_SIZE;
         let mem_disk = MemDisk::create(nblocks).unwrap();
         let greedy_victim_policy = GreedyVictimPolicy {};
@@ -303,15 +323,18 @@ mod tests {
         let gc_worker = disk
             .create_gc_worker(Arc::new(greedy_victim_policy))
             .unwrap();
-        // doesn't trigger gc
-        gc_worker.background_gc().unwrap();
+        //  background gc won't be triggered
+        // gc_worker.background_gc().unwrap();
 
         let content: Vec<u8> = vec![1; BLOCK_SIZE];
         let mut buf = Buf::alloc(1).unwrap();
         buf.as_mut_slice().copy_from_slice(&content);
-        disk.write(0, buf.as_ref()).unwrap();
-        disk.sync().unwrap();
+        for _ in 0..300 {
+            disk.write(0, buf.as_ref()).unwrap();
+            disk.sync().unwrap();
+        }
 
+        //std::thread::sleep(Duration::from_secs(5));
         gc_worker.background_gc().unwrap();
         // after gc, the block at offset 0 should be migrated to another chunk
         // TODO: check the content of the block after support remapping LBA -> HBA
