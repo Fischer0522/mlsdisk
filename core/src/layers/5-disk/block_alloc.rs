@@ -50,11 +50,6 @@ pub(super) enum AllocDiff {
 }
 const DIFF_RECORD_SIZE: usize = size_of::<AllocDiff>() + size_of::<Hba>();
 
-pub(super) enum AllocStatus {
-    Compaction,
-    Gc,
-}
-
 impl AllocTable {
     /// Create a new `AllocTable` given the total number of blocks.
     pub fn new(nblocks: NonZeroUsize) -> Self {
@@ -406,26 +401,17 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
     }
 
     /// Update the metadata in diff table to the in-memory block validity table.
-    pub fn update_alloc_table(&self, status: AllocStatus) {
+    pub fn update_alloc_table(&self) {
         let diff_table = self.diff_table.lock();
         let alloc_table = &self.alloc_table;
         let mut num_free = alloc_table.num_free.lock().unwrap();
         let mut bitmap = alloc_table.bitmap.lock();
         let mut num_dealloc = 0_usize;
-        let mut num_alloc = 0_usize;
         for (block_id, block_diff) in diff_table.iter() {
             match block_diff {
-                AllocDiff::Alloc => match status {
-                    AllocStatus::Compaction => {
-                        debug_assert!(!bitmap[*block_id]);
-                    }
-                    AllocStatus::Gc => {
-                        debug_assert!(bitmap[*block_id]);
-                        bitmap.set(*block_id, false);
-
-                        num_alloc += 1;
-                    }
-                },
+                AllocDiff::Alloc => {
+                    debug_assert!(!bitmap[*block_id]);
+                }
                 AllocDiff::Dealloc => {
                     debug_assert!(!bitmap[*block_id]);
                     bitmap.set(*block_id, true);
@@ -436,7 +422,6 @@ impl<D: BlockSet + 'static> BlockAlloc<D> {
         }
 
         *num_free += num_dealloc;
-        *num_free -= num_alloc;
         const AVG_ALLOC_COUNT: usize = 1024;
         if *num_free >= AVG_ALLOC_COUNT {
             alloc_table.cvar.notify_one();

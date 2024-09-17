@@ -39,4 +39,5 @@ mod gc;
 mod reverse_index;
 mod sworndisk;
 
+pub use self::gc::{SharedState, SharedStateRef};
 pub use self::sworndisk::SwornDisk;

@@ -250,6 +250,8 @@ mod benches {
                     ),
                     AeadKey::default(),
                     None,
+                    true,
+                    None,
                 )?),
 
                 DiskType::EncDisk => Arc::new(EncDisk::create(

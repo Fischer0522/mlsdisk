@@ -8,18 +8,20 @@
 //! allocation metadata. `TxLsmTree` and `BlockAlloc` are manipulated
 //! based on internal transactions.
 use super::bio::{BioReq, BioReqQueue, BioResp, BioType};
-use super::block_alloc::{AllocStatus, AllocTable, BlockAlloc};
+use super::block_alloc::{AllocTable, BlockAlloc};
 use super::data_buf::DataBuf;
-use super::gc::{GcWorker, VictimPolicy, VictimPolicyRef};
+use super::gc::{GcWorker, SharedStateRef, VictimPolicy, VictimPolicyRef};
 use super::reverse_index::ReverseIndexTable;
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
-use crate::layers::disk::gc::GreedyVictimPolicy;
+use crate::layers::disk::gc::{GreedyVictimPolicy, SharedState};
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
     AsKV, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, SyncIdStore,
     TxEventListener, TxEventListenerFactory, TxLsmTree, TxType,
 };
-use crate::os::{Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, BTreeMap, RwLock};
+use crate::os::{
+    Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, BTreeMap, Condvar, CvarMutex, RwLock,
+};
 use crate::prelude::*;
 use crate::tx::Tx;
 
@@ -62,6 +64,8 @@ struct DiskInner<D: BlockSet> {
     is_dropped: AtomicBool,
     /// Scope lock for control write and sync operation.
     write_sync_region: RwLock<()>,
+    /// Shared state for background GC.
+    shared_state: SharedStateRef,
 }
 
 impl<D: BlockSet + 'static> SwornDisk<D> {
@@ -116,6 +120,8 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         disk: D,
         root_key: Key,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        enable_gc: bool,
+        victim_policy_ref: Option<VictimPolicyRef>,
     ) -> Result<Self> {
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
@@ -128,6 +134,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             tx_log_store.clone(),
             block_validity_table.clone(),
         ));
+        let shared_state = Arc::new(SharedState::new());
 
         let logical_block_table = {
             let table = block_validity_table.clone();
@@ -140,6 +147,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 listener_factory,
                 Some(Arc::new(on_drop_record_in_memtable)),
                 sync_id_store,
+                shared_state.clone(),
             )?
         };
         let inner = Arc::new(DiskInner {
@@ -153,10 +161,19 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             root_key,
             is_dropped: AtomicBool::new(false),
             write_sync_region: RwLock::new(()),
+            shared_state,
         });
-
-        let gc_worker = Arc::new(inner.create_gc_worker(Arc::new(GreedyVictimPolicy {}))?);
-        thread::spawn(move || gc_worker.run());
+        if enable_gc {
+            let gc_worker = match victim_policy_ref {
+                Some(policy_ref) => inner.create_gc_worker(policy_ref)?,
+                None => {
+                    // use GreedyVictimPolicy by default
+                    let policy = Arc::new(GreedyVictimPolicy {});
+                    inner.create_gc_worker(policy)?
+                }
+            };
+            thread::spawn(move || gc_worker.run());
+        }
 
         let new_self = Self { inner };
 
@@ -172,6 +189,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         root_key: Key,
         victim_policy_ref: Option<VictimPolicyRef>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        enable_gc: bool,
     ) -> Result<Self> {
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
@@ -185,6 +203,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             tx_log_store.clone(),
             block_validity_table.clone(),
         ));
+        let shared_state = Arc::new(SharedState::new());
 
         let logical_block_table = {
             let table = block_validity_table.clone();
@@ -197,6 +216,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 listener_factory,
                 Some(Arc::new(on_drop_record_in_memtable)),
                 sync_id_store,
+                shared_state.clone(),
             )?
         };
 
@@ -214,17 +234,20 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             root_key,
             is_dropped: AtomicBool::new(false),
             write_sync_region: RwLock::new(()),
+            shared_state,
         });
 
-        let gc_worker = match victim_policy_ref {
-            Some(policy_ref) => inner.create_gc_worker(policy_ref)?,
-            None => {
-                // use GreedyVictimPolicy by default
-                let policy = Arc::new(GreedyVictimPolicy {});
-                inner.create_gc_worker(policy)?
-            }
-        };
-        thread::spawn(move || gc_worker.run());
+        if enable_gc {
+            let gc_worker = match victim_policy_ref {
+                Some(policy_ref) => inner.create_gc_worker(policy_ref)?,
+                None => {
+                    // use GreedyVictimPolicy by default
+                    let policy = Arc::new(GreedyVictimPolicy {});
+                    inner.create_gc_worker(policy)?
+                }
+            };
+            thread::spawn(move || gc_worker.run());
+        }
 
         let opened_self = Self { inner };
 
@@ -319,6 +342,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             return Ok(());
         }
 
+        self.wait_for_background_gc();
         // Search in `TxLsmTree` then
         let value = self.logical_block_table.get(&RecordKey { lba })?;
 
@@ -357,6 +381,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         if range_query_ctx.is_completed() {
             return Ok(());
         }
+        self.wait_for_background_gc();
 
         // Search in `TxLsmTree` then
         self.logical_block_table.get_range(&mut range_query_ctx)?;
@@ -403,6 +428,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             // Flush all data blocks in `DataBuf` to disk if it's full
             if buf_at_capacity {
                 // TODO: Error handling: Should discard current write in `DataBuf`
+                // flush_data_buf will wait for background GC to finish
                 self.flush_data_buf()?;
             }
             lba += 1;
@@ -421,6 +447,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     }
 
     fn flush_data_buf(&self) -> Result<()> {
+        self.wait_for_background_gc();
         let records = self.write_blocks_from_data_buf()?;
         // Insert new records of data blocks to `TxLsmTree`
         for (key, value) in records.iter() {
@@ -483,6 +510,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
     /// Sync all cached data in the device to the storage medium for durability.
     pub fn sync(&self) -> Result<()> {
+        // flush_data_buf will wait for background GC to finish
         self.flush_data_buf()?;
         debug_assert!(self.data_buf.is_empty());
 
@@ -518,6 +546,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             self.tx_log_store.clone(),
             self.block_validity_table.clone(),
             self.user_data_disk.clone(),
+            self.shared_state.clone(),
         );
         Ok(gc_worker)
     }
@@ -565,6 +594,17 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     fn do_sync(&self, req: &BioReq) -> BioResp {
         debug_assert_eq!(req.type_(), BioType::Sync);
         self.sync()
+    }
+
+    // TODO: Currently, Background GC will block foreground I/O requests, but background gc will be launched when some foreground I/O requests remain running.
+    // this might cause some issue
+
+    // GcWorker will touch block_validity_table, logical_block_table and reverse_index_table and user_data_disk.
+    // In the stop the world manner. to maximize the concurrency, we should call this function after accessing data_buf and before accessing these data structures.
+    // To simplify the implementation, we should only call this function in some fn related to accessing these data structures directly.
+    // E.g. fn flush_data_buf(), read_one_block(), read_multi_blocks()
+    fn wait_for_background_gc(&self) {
+        self.shared_state.wait_for_background_gc();
     }
 }
 
@@ -712,9 +752,7 @@ impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTre
 
     fn on_tx_commit(&self) {
         match self.tx_type {
-            TxType::Compaction { .. } | TxType::Migration => {
-                self.block_alloc.update_alloc_table(AllocStatus::Compaction)
-            }
+            TxType::Compaction { .. } | TxType::Migration => self.block_alloc.update_alloc_table(),
         }
     }
 }
@@ -857,7 +895,7 @@ mod tests {
         let mem_disk = MemDisk::create(nblocks)?;
         let root_key = Key::random();
         // Create a new `SwornDisk` then do some writes
-        let sworndisk = SwornDisk::create(mem_disk.clone(), root_key, None)?;
+        let sworndisk = SwornDisk::create(mem_disk.clone(), root_key, None, false, None)?;
         let num_rw = 1024;
 
         // Submit a write block I/O request
@@ -894,7 +932,7 @@ mod tests {
         // Open the closed `SwornDisk` then test its data's existence
         drop(sworndisk);
         thread::spawn(move || -> Result<()> {
-            let opened_sworndisk = SwornDisk::open(mem_disk, root_key, None, None)?;
+            let opened_sworndisk = SwornDisk::open(mem_disk, root_key, None, None, false)?;
             let mut rbuf = Buf::alloc(2)?;
             opened_sworndisk.read(5 as Lba, rbuf.as_mut())?;
             assert_eq!(rbuf.as_slice()[0], 5u8);

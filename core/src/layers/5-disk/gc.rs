@@ -4,10 +4,7 @@ use super::{
     reverse_index::ReverseIndexTable,
     sworndisk::{Hba, Lba, RecordKey, RecordValue},
 };
-use crate::{
-    layers::{disk::block_alloc::AllocStatus, lsm::TxLsmTree},
-    BlockSet,
-};
+use crate::{layers::lsm::TxLsmTree, BlockSet};
 use crate::{
     layers::{
         disk::{bio::BlockBuf, block_alloc},
@@ -17,7 +14,7 @@ use crate::{
     Buf, BLOCK_SIZE,
 };
 use crate::{
-    os::{Arc, BTreeMap, Mutex, Vec},
+    os::{Arc, BTreeMap, Condvar, CvarMutex, Mutex, Vec},
     prelude,
 };
 use core::{
@@ -31,6 +28,71 @@ use log::debug;
 const DEFAULT_GC_INTERVAL_TIME: std::time::Duration = std::time::Duration::from_secs(30);
 const GC_WATERMARK: usize = 16;
 const DEFAULT_GC_THRESHOLD: f64 = 0.2;
+
+// SharedState is used to synchronize background GC and foreground I/O requests and lsm compaction
+// 1. Background GC will stop the world, I/O requests and lsm compaction will be blocked
+// 2. Background GC should wait until lsm compaction are done
+// TODO: 3. Should background GC wait for all I/O requests to finished?
+
+pub type SharedStateRef = Arc<SharedState>;
+pub struct SharedState {
+    gc_in_progress: CvarMutex<bool>,
+    compaction_in_progress: CvarMutex<bool>,
+    gc_condvar: Condvar,
+    compaction_condvar: Condvar,
+}
+
+impl SharedState {
+    pub fn new() -> Self {
+        Self {
+            gc_in_progress: CvarMutex::new(false),
+            compaction_in_progress: CvarMutex::new(false),
+            gc_condvar: Condvar::new(),
+            compaction_condvar: Condvar::new(),
+        }
+    }
+
+    // Compaction worker and I/O requests will call this function to wait for background GC
+    pub fn wait_for_background_gc(&self) {
+        let mut gc_in_progress = self.gc_in_progress.lock().unwrap();
+        while *gc_in_progress {
+            #[cfg(not(feature = "linux"))]
+            debug!("Waiting for background GC to finish");
+            gc_in_progress = self.gc_condvar.wait(gc_in_progress).unwrap();
+        }
+    }
+
+    // Background GC will call this function to wait for compaction finished
+    pub fn wait_for_compaction(&self) {
+        let mut compaction_in_progress = self.compaction_in_progress.lock().unwrap();
+        while *compaction_in_progress {
+            #[cfg(not(feature = "linux"))]
+            debug!("Waiting for compaction to finish");
+            compaction_in_progress = self
+                .compaction_condvar
+                .wait(compaction_in_progress)
+                .unwrap();
+        }
+    }
+
+    pub fn start_gc(&self) {
+        *self.gc_in_progress.lock().unwrap() = true;
+    }
+
+    pub fn start_compaction(&self) {
+        *self.compaction_in_progress.lock().unwrap() = true;
+    }
+
+    pub fn notify_gc_finished(&self) {
+        *self.gc_in_progress.lock().unwrap() = false;
+        self.gc_condvar.notify_all();
+    }
+
+    pub fn notify_compaction_finished(&self) {
+        *self.compaction_in_progress.lock().unwrap() = false;
+        self.compaction_condvar.notify_all();
+    }
+}
 
 pub struct Victim {
     chunk_id: ChunkId,
@@ -107,7 +169,7 @@ pub(super) struct GcWorker<D> {
     block_validity_table: Arc<AllocTable>,
     tx_log_store: Arc<TxLogStore<D>>,
     user_data_disk: Arc<D>,
-    doing_background_gc: AtomicBool,
+    shared_state: SharedStateRef,
 }
 
 impl<D: BlockSet + 'static> GcWorker<D> {
@@ -118,33 +180,32 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         tx_log_store: Arc<TxLogStore<D>>,
         block_validity_table: Arc<AllocTable>,
         user_data_disk: Arc<D>,
+        shared_state: SharedStateRef,
     ) -> Self {
         Self {
             victim_policy,
             logical_block_table,
+            reverse_index_table,
             block_validity_table,
             tx_log_store,
             user_data_disk,
-            doing_background_gc: AtomicBool::new(false),
-            reverse_index_table,
+            shared_state,
         }
     }
 
     pub fn run(&self) -> Result<()> {
         loop {
-            self.doing_background_gc.store(true, Ordering::Release);
+            self.shared_state.start_gc();
             self.background_gc()?;
-            self.doing_background_gc.store(false, Ordering::Release);
+            // Notify foreground GC and foreground I/O Requests
+            self.shared_state.notify_gc_finished();
             // FIXME: use a cross-platform sleep function
             std::thread::sleep(DEFAULT_GC_INTERVAL_TIME);
         }
     }
 
     pub fn foreground_gc(&self) -> Result<()> {
-        if self.doing_background_gc.load(Ordering::Acquire) {
-            debug!("Background GC is running, skip foreground GC");
-            return Ok(());
-        }
+        self.shared_state.wait_for_background_gc();
         let victim = self.victim_policy.pick_victim(
             self.block_validity_table.get_chunk_info_table_ref(),
             DEFAULT_GC_THRESHOLD,
@@ -178,6 +239,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             self.reverse_index_table
                 .remap_index_batch(remapped_hbas, &self.logical_block_table)?;
         }
+        #[cfg(not(feature = "linux"))]
         debug!(
             "Background GC succeed, freed {} chunks, chunk_ids: {:?}",
             chunk_ids.len(),
@@ -219,10 +281,6 @@ impl<D: BlockSet + 'static> GcWorker<D> {
                 .write(target_hba, victim_block.as_ref())?;
         }
 
-        victim_hbas
-            .iter()
-            .for_each(|hba| self.block_validity_table.set_deallocated(*hba));
-
         target_hbas
             .iter()
             .for_each(|hba| self.block_validity_table.set_allocated(*hba));
@@ -236,6 +294,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         if victim.is_none() {
             return false;
         }
+        #[cfg(not(feature = "linux"))]
         debug!(
             "Triggered background GC, victim chunk: {}",
             victim.unwrap().chunk_id
@@ -266,6 +325,133 @@ mod tests {
     };
     use core::num::NonZeroUsize;
     use std::sync::Arc;
+
+    fn init_logger() {
+        env_logger::builder()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Debug)
+            .try_init()
+            .unwrap();
+    }
+    // I/O request will wait for background GC to finish
+    #[test]
+    fn io_and_gc_test() {
+        init_logger();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_clone = finished.clone();
+        let shared_state = Arc::new(SharedState::new());
+        let state_clone = shared_state.clone();
+        assert!(!finished.load(Ordering::Acquire));
+
+        std::thread::spawn(move || {
+            shared_state.start_gc();
+            std::thread::sleep(Duration::from_millis(100));
+            finished_clone.store(true, Ordering::Release);
+            shared_state.notify_gc_finished();
+        });
+        // Wait for background GC to start
+        std::thread::sleep(Duration::from_millis(100));
+        state_clone.wait_for_background_gc();
+        assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn gc_waits_for_compaction_test() {
+        init_logger();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_clone = finished.clone();
+        let shared_state = Arc::new(SharedState::new());
+        let state_clone = shared_state.clone();
+        let _compaction_thread = std::thread::spawn(move || {
+            shared_state.wait_for_background_gc();
+            shared_state.start_compaction();
+            std::thread::sleep(Duration::from_millis(20));
+            finished.store(true, Ordering::Release);
+            shared_state.notify_compaction_finished();
+        });
+
+        let gc_thread = std::thread::spawn(move || {
+            assert!(!finished_clone.load(Ordering::Acquire));
+            std::thread::sleep(Duration::from_millis(10));
+            state_clone.wait_for_compaction();
+            state_clone.start_gc();
+            std::thread::sleep(Duration::from_millis(10));
+            assert!(finished_clone.load(Ordering::Acquire));
+            state_clone.notify_gc_finished();
+        });
+
+        gc_thread.join().unwrap();
+    }
+    #[test]
+    fn compaction_waits_for_gc_test() {
+        init_logger();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_clone = finished.clone();
+        let shared_state = Arc::new(SharedState::new());
+        let state_clone = shared_state.clone();
+        let compaction_thread = std::thread::spawn(move || {
+            assert!(!finished.load(Ordering::Acquire));
+            std::thread::sleep(Duration::from_millis(10));
+            shared_state.wait_for_background_gc();
+            shared_state.start_compaction();
+            finished.store(true, Ordering::Release);
+            shared_state.notify_compaction_finished();
+        });
+
+        let _gc_thread = std::thread::spawn(move || {
+            state_clone.wait_for_compaction();
+            state_clone.start_gc();
+            std::thread::sleep(Duration::from_millis(20));
+            finished_clone.store(true, Ordering::Release);
+            state_clone.notify_gc_finished();
+        });
+
+        compaction_thread.join().unwrap();
+    }
+
+    // gc waits for compaction, io waits for gc
+    #[test]
+    fn compaction_gc_io_test() {
+        init_logger();
+        let finished = Arc::new(AtomicUsize::new(0));
+        let shared_state = Arc::new(SharedState::new());
+
+        std::thread::spawn({
+            let finished = Arc::clone(&finished);
+            let shared_state = Arc::clone(&shared_state);
+            move || {
+                assert!(finished.load(Ordering::Acquire) == 0);
+                std::thread::sleep(Duration::from_millis(10));
+                shared_state.wait_for_background_gc();
+                shared_state.start_compaction();
+                finished.store(1, Ordering::Release);
+                shared_state.notify_compaction_finished();
+            }
+        });
+
+        std::thread::spawn({
+            let finished = Arc::clone(&finished);
+            let shared_state = Arc::clone(&shared_state);
+            move || {
+                std::thread::sleep(Duration::from_millis(20));
+                shared_state.wait_for_compaction();
+                assert_eq!(finished.load(Ordering::Acquire), 1);
+                shared_state.start_gc();
+                std::thread::sleep(Duration::from_millis(20));
+                finished.store(2, Ordering::Release);
+                shared_state.notify_gc_finished();
+            }
+        });
+
+        // background hasn't started yet return immediately
+        shared_state.wait_for_background_gc();
+        assert_eq!(finished.load(Ordering::Acquire), 0);
+        std::thread::sleep(Duration::from_millis(30));
+
+        shared_state.wait_for_background_gc();
+        // background gc is running, wait for it to finish. result is modified by background gc thread
+        assert_eq!(finished.load(Ordering::Acquire), 2);
+    }
 
     #[test]
     fn greedy_victim_policy_test() {
@@ -309,34 +495,35 @@ mod tests {
 
     #[test]
     fn simple_data_migration() {
-        env_logger::builder()
-            .is_test(true)
-            .filter_level(log::LevelFilter::Debug)
-            .try_init()
-            .unwrap();
+        init_logger();
         let nblocks = 64 * CHUNK_SIZE;
         let mem_disk = MemDisk::create(nblocks).unwrap();
         let greedy_victim_policy = GreedyVictimPolicy {};
         let root_key = AeadKey::random();
 
-        let disk = SwornDisk::create(mem_disk, root_key, None).unwrap();
+        let disk = SwornDisk::create(mem_disk, root_key, None, true, None).unwrap();
         let gc_worker = disk
             .create_gc_worker(Arc::new(greedy_victim_policy))
             .unwrap();
-        //  background gc won't be triggered
-        // gc_worker.background_gc().unwrap();
+        //   background gc won't be triggered
+        gc_worker.background_gc().unwrap();
 
         let content: Vec<u8> = vec![1; BLOCK_SIZE];
         let mut buf = Buf::alloc(1).unwrap();
         buf.as_mut_slice().copy_from_slice(&content);
+
+        // write enough blocks to trigger gc,[0-298] blocks is invalid chunk, only block 299 will be migrated
         for _ in 0..300 {
             disk.write(0, buf.as_ref()).unwrap();
             disk.sync().unwrap();
         }
 
-        //std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_secs(5));
         gc_worker.background_gc().unwrap();
+
         // after gc, the block at offset 0 should be migrated to another chunk
-        // TODO: check the content of the block after support remapping LBA -> HBA
+        let mut read_buf = Buf::alloc(1).unwrap();
+        disk.read(0, read_buf.as_mut()).unwrap();
+        assert_eq!(read_buf.as_slice(), content);
     }
 }
