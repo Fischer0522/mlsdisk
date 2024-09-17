@@ -336,7 +336,7 @@ mod tests {
     // I/O request will wait for background GC to finish
     #[test]
     fn io_and_gc_test() {
-        init_logger();
+        //    init_logger();
         let finished = Arc::new(AtomicBool::new(false));
         let finished_clone = finished.clone();
         let shared_state = Arc::new(SharedState::new());
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn gc_waits_for_compaction_test() {
-        init_logger();
+        // init_logger();
         let finished = Arc::new(AtomicBool::new(false));
         let finished_clone = finished.clone();
         let shared_state = Arc::new(SharedState::new());
@@ -384,7 +384,7 @@ mod tests {
     }
     #[test]
     fn compaction_waits_for_gc_test() {
-        init_logger();
+        // init_logger();
         let finished = Arc::new(AtomicBool::new(false));
         let finished_clone = finished.clone();
         let shared_state = Arc::new(SharedState::new());
@@ -412,7 +412,7 @@ mod tests {
     // gc waits for compaction, io waits for gc
     #[test]
     fn compaction_gc_io_test() {
-        init_logger();
+        //  init_logger();
         let finished = Arc::new(AtomicUsize::new(0));
         let shared_state = Arc::new(SharedState::new());
 
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn simple_data_migration() {
-        init_logger();
+        //    init_logger();
         let nblocks = 64 * CHUNK_SIZE;
         let mem_disk = MemDisk::create(nblocks).unwrap();
         let greedy_victim_policy = GreedyVictimPolicy {};
