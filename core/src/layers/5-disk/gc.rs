@@ -274,6 +274,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
 
         debug_assert_eq!(victim_hbas.len(), target_hbas.len());
         for (victim_hba, target_hba) in victim_hbas.iter().zip(target_hbas.clone()) {
+            // TODO: use ReverseIndexTable and LogicalBlockTable to discard the invalid block
             let mut victim_block = Buf::alloc(1)?;
             self.user_data_disk
                 .read(*victim_hba, victim_block.as_mut())?;
@@ -290,6 +291,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         Ok(victim_hbas.into_iter().zip(target_hbas).collect())
     }
 
+    // TODO: Support more rules
     fn trigger_gc(&self, victim: Option<&Victim>) -> bool {
         if victim.is_none() {
             return false;

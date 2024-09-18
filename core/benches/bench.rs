@@ -250,7 +250,7 @@ mod benches {
                     ),
                     AeadKey::default(),
                     None,
-                    true,
+                    false,
                     None,
                 )?),
 
