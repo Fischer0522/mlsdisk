@@ -385,15 +385,20 @@ mod tests {
         AeadKey, RandomInit, SwornDisk,
     };
     use core::num::NonZeroUsize;
-    use std::sync::Arc;
+    use std::sync::{Arc, Once};
+
+    static INIT_LOG: Once = Once::new();
 
     fn init_logger() {
-        env_logger::builder()
-            .is_test(true)
-            .filter_level(log::LevelFilter::Debug)
-            .try_init()
-            .unwrap();
+        INIT_LOG.call_once(|| {
+            env_logger::builder()
+                .is_test(true)
+                .filter_level(log::LevelFilter::Debug)
+                .try_init()
+                .unwrap();
+        });
     }
+
     // I/O request will wait for background GC to finish
     #[test]
     fn io_and_gc_test() {
