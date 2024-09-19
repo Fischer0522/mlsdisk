@@ -18,6 +18,14 @@ impl ReverseIndexTable {
         }
     }
 
+    pub fn get_lba(&self, old_hba: &Hba) -> Lba {
+        let index_table = self.index_table.lock();
+        index_table
+            .get(&old_hba)
+            .map(|lba| *lba)
+            .expect("hba should exist in index table")
+    }
+
     pub fn update_index_batch(&self, records: impl Iterator<Item = (RecordKey, RecordValue)>) {
         let mut index_table = self.index_table.lock();
         records.for_each(|(key, value)| {
@@ -33,10 +41,15 @@ impl ReverseIndexTable {
     pub fn remap_index_batch<D: BlockSet + 'static>(
         &self,
         remapped_hbas: Vec<(Hba, Hba)>,
+        discard_hbas: Vec<(Lba, Hba)>,
         tx_lsm_tree: &TxLsmTree<RecordKey, RecordValue, D>,
     ) -> Result<()> {
         let mut index_table = self.index_table.lock();
         let mut dealloc_table = self.dealloc_table.lock();
+
+        discard_hbas.into_iter().for_each(|(lba, hba)| {
+            dealloc_table.insert(lba, hba);
+        });
         remapped_hbas
             .into_iter()
             .try_for_each(|(old_hba, new_hba)| {
@@ -59,9 +72,6 @@ impl ReverseIndexTable {
 
                 // write the record back to lsm tree
                 tx_lsm_tree.put(record_key, record_value)?;
-
-                // record the lba -> old hba mapping into the dealloc table
-                dealloc_table.insert(lba, old_hba);
 
                 // update the reverse index table
                 index_table.insert(new_hba, lba);
