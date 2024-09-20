@@ -1,3 +1,5 @@
+use log::debug;
+
 use super::sworndisk::{Hba, Lba, RecordKey, RecordValue};
 use crate::prelude::{Error, Result, Vec};
 use crate::{
@@ -26,6 +28,15 @@ impl ReverseIndexTable {
             .expect("hba should exist in index table")
     }
 
+    pub fn has_deallocated(&self, lba: Lba) -> bool {
+        let dealloc_table = self.dealloc_table.lock();
+        dealloc_table.contains_key(&lba)
+    }
+    pub fn finish_deallocated(&self, lba: Lba) {
+        let mut dealloc_table = self.dealloc_table.lock();
+        dealloc_table.remove(&lba);
+    }
+
     pub fn update_index_batch(&self, records: impl Iterator<Item = (RecordKey, RecordValue)>) {
         let mut index_table = self.index_table.lock();
         records.for_each(|(key, value)| {
@@ -45,11 +56,7 @@ impl ReverseIndexTable {
         tx_lsm_tree: &TxLsmTree<RecordKey, RecordValue, D>,
     ) -> Result<()> {
         let mut index_table = self.index_table.lock();
-        let mut dealloc_table = self.dealloc_table.lock();
 
-        discard_hbas.into_iter().for_each(|(lba, hba)| {
-            dealloc_table.insert(lba, hba);
-        });
         remapped_hbas
             .into_iter()
             .try_for_each(|(old_hba, new_hba)| {
@@ -77,7 +84,14 @@ impl ReverseIndexTable {
                 index_table.insert(new_hba, lba);
                 index_table.remove(&old_hba);
                 Ok::<_, Error>(())
-            })
+            })?;
+
+        // Access dealloc table after lsm to avoid deadlock
+        let mut dealloc_table = self.dealloc_table.lock();
+        discard_hbas.into_iter().for_each(|(lba, hba)| {
+            dealloc_table.insert(lba, hba);
+        });
+        Ok::<_, Error>(())
     }
 
     pub fn recover<D: BlockSet + 'static>(

@@ -28,9 +28,9 @@ use core::{
 use hashbrown::{HashMap, HashSet};
 use log::debug;
 // Default gc interval time is 30 seconds
-const DEFAULT_GC_INTERVAL_TIME: std::time::Duration = std::time::Duration::from_secs(30);
+const DEFAULT_GC_INTERVAL_TIME: std::time::Duration = std::time::Duration::from_secs(3);
 const GC_WATERMARK: usize = 16;
-const DEFAULT_GC_THRESHOLD: f64 = 0.2;
+const DEFAULT_GC_THRESHOLD: f64 = 0.5;
 
 // SharedState is used to synchronize background GC and foreground I/O requests and lsm compaction
 // 1. Background GC will stop the world, I/O requests and lsm compaction will be blocked
@@ -79,20 +79,24 @@ impl SharedState {
     }
 
     pub fn start_gc(&self) {
-        *self.gc_in_progress.lock().unwrap() = true;
+        let mut gc_in_progress = self.gc_in_progress.lock().unwrap();
+        *gc_in_progress = true;
     }
 
     pub fn start_compaction(&self) {
-        *self.compaction_in_progress.lock().unwrap() = true;
+        let mut compaction_in_progress = self.compaction_in_progress.lock().unwrap();
+        *compaction_in_progress = true;
     }
 
     pub fn notify_gc_finished(&self) {
-        *self.gc_in_progress.lock().unwrap() = false;
+        let mut gc_in_progress = self.gc_in_progress.lock().unwrap();
+        *gc_in_progress = false;
         self.gc_condvar.notify_all();
     }
 
     pub fn notify_compaction_finished(&self) {
-        *self.compaction_in_progress.lock().unwrap() = false;
+        let mut compaction_in_progress = self.compaction_in_progress.lock().unwrap();
+        *compaction_in_progress = false;
         self.compaction_condvar.notify_all();
     }
 }
@@ -141,6 +145,14 @@ impl VictimPolicy for GreedyVictimPolicy {
 
 pub struct LoopScanVictimPolicy {
     cursor: AtomicUsize,
+}
+
+impl LoopScanVictimPolicy {
+    pub fn new() -> Self {
+        Self {
+            cursor: AtomicUsize::new(0),
+        }
+    }
 }
 
 impl VictimPolicy for LoopScanVictimPolicy {
@@ -198,6 +210,8 @@ impl<D: BlockSet + 'static> GcWorker<D> {
 
     pub fn run(&self) -> Result<()> {
         loop {
+            #[cfg(not(feature = "linux"))]
+            debug!("Background GC started");
             self.shared_state.start_gc();
             self.background_gc()?;
             // Notify foreground GC and foreground I/O Requests
@@ -228,6 +242,8 @@ impl<D: BlockSet + 'static> GcWorker<D> {
 
     // TODO: use tx to migrate data from victim to other chunk and update metadata
     pub fn background_gc(&self) -> Result<()> {
+        // FIXME: use a cross-platform time function
+        let start = std::time::Instant::now();
         let mut chunk_ids = Vec::with_capacity(GC_WATERMARK);
         for _ in 0..GC_WATERMARK {
             let victim = self.victim_policy.pick_victim(
@@ -242,17 +258,20 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             };
             chunk_ids.push(victim.chunk_id);
             let (remapped_hbas, discard_hbas) = self.clean_and_migrate_data(victim)?;
+
             self.reverse_index_table.remap_index_batch(
                 remapped_hbas,
                 discard_hbas,
                 &self.logical_block_table,
             )?;
         }
+        let duration = start.elapsed();
         #[cfg(not(feature = "linux"))]
         debug!(
-            "Background GC succeed, freed {} chunks, chunk_ids: {:?}",
+            "Background GC succeed, freed {} chunks, chunk_ids: {:?},took {:?}",
             chunk_ids.len(),
-            chunk_ids
+            chunk_ids,
+            duration
         );
         Ok(())
     }
@@ -310,13 +329,13 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         let victim_chunk = &self.block_validity_table.get_chunk_info_table_ref()[victim.chunk_id];
 
         // TODO: use tx to migrate data from victim to other chunk ?
-        let (victim_hbas, discard_hbas, free_hbas) = self.find_target_hbas(victim)?;
+        let (valid_hbas, discard_hbas, free_hbas) = self.find_target_hbas(victim)?;
         let mut victim_data = Buf::alloc(victim_chunk.nblocks())?;
         let offset = victim_chunk.chunk_id() * CHUNK_SIZE;
         self.user_data_disk.read(offset, victim_data.as_mut())?;
 
         let target_hba_batches = free_hbas.group_by(|hba1, hba2| hba2.saturating_sub(*hba1) == 1);
-        let mut victim_hba_iter = victim_hbas.iter();
+        let mut victim_hba_iter = valid_hbas.iter();
         for target_hba_batch in target_hba_batches {
             let batch_len = target_hba_batch.len();
             let mut write_buf = Buf::alloc(batch_len)?;
@@ -326,11 +345,12 @@ impl<D: BlockSet + 'static> GcWorker<D> {
                 let Some(victim_hba) = victim_hba_iter.next() else {
                     break;
                 };
-                let start = victim_hba * BLOCK_SIZE;
-                let end = (victim_hba + 1) * BLOCK_SIZE;
+                let start = (victim_hba % CHUNK_SIZE) * BLOCK_SIZE;
+                let end = start + BLOCK_SIZE;
 
                 let des_start = i * BLOCK_SIZE;
-                write_buf.as_mut_slice()[des_start..des_start + BLOCK_SIZE]
+                let des_end = (i + 1) * BLOCK_SIZE;
+                write_buf.as_mut_slice()[des_start..des_end]
                     .copy_from_slice(&victim_data.as_slice()[start..end]);
             }
 
@@ -345,7 +365,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         victim_chunk.clear_chunk();
 
         Ok((
-            victim_hbas.into_iter().zip(free_hbas).collect(),
+            valid_hbas.into_iter().zip(free_hbas).collect(),
             discard_hbas,
         ))
     }

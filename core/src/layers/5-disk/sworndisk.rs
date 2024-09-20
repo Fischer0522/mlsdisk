@@ -130,16 +130,23 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let block_validity_table = Arc::new(AllocTable::new(
             NonZeroUsize::new(data_disk.nblocks()).unwrap(),
         ));
+        let reverse_index_table = Arc::new(ReverseIndexTable::new());
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
+            reverse_index_table.clone(),
         ));
         let shared_state = Arc::new(SharedState::new());
 
         let logical_block_table = {
             let table = block_validity_table.clone();
+            let rit = reverse_index_table.clone();
             let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
                 // Deallocate the host block while the corresponding record is dropped in `MemTable`
+                if rit.has_deallocated(record.value().hba) {
+                    rit.finish_deallocated(record.value().hba);
+                    return;
+                }
                 table.set_deallocated(record.value().hba);
             };
             TxLsmTree::format(
@@ -153,7 +160,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let inner = Arc::new(DiskInner {
             bio_req_queue: BioReqQueue::new(),
             logical_block_table,
-            reverse_index_table: Arc::new(ReverseIndexTable::new()),
+            reverse_index_table,
             user_data_disk: Arc::new(data_disk),
             block_validity_table,
             tx_log_store,
@@ -199,16 +206,24 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             NonZeroUsize::new(data_disk.nblocks()).unwrap(),
             &tx_log_store,
         )?);
+
+        let shared_state = Arc::new(SharedState::new());
+
+        let reverse_index_table = Arc::new(ReverseIndexTable::new());
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
+            reverse_index_table.clone(),
         ));
-        let shared_state = Arc::new(SharedState::new());
 
         let logical_block_table = {
             let table = block_validity_table.clone();
+            let rit = reverse_index_table.clone();
             let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
-                // Deallocate the host block while the corresponding record is dropped in `MemTable`
+                //  Deallocate the host block while the corresponding record is dropped in `MemTable`
+                if rit.has_deallocated(record.value().hba) {
+                    return;
+                }
                 table.set_deallocated(record.value().hba);
             };
             TxLsmTree::recover(
@@ -221,8 +236,6 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         };
 
         // TODO: Recover RIT from TxLsmTree
-        let reverse_index_table = Arc::new(ReverseIndexTable::new());
-
         let inner = Arc::new(DiskInner {
             bio_req_queue: BioReqQueue::new(),
             logical_block_table,
@@ -665,11 +678,20 @@ unsafe impl<D: BlockSet> Sync for DiskInner<D> {}
 struct TxLsmTreeListenerFactory<D> {
     store: Arc<TxLogStore<D>>,
     alloc_table: Arc<AllocTable>,
+    reverse_index_table: Arc<ReverseIndexTable>,
 }
 
 impl<D> TxLsmTreeListenerFactory<D> {
-    fn new(store: Arc<TxLogStore<D>>, alloc_table: Arc<AllocTable>) -> Self {
-        Self { store, alloc_table }
+    fn new(
+        store: Arc<TxLogStore<D>>,
+        alloc_table: Arc<AllocTable>,
+        reverse_index_table: Arc<ReverseIndexTable>,
+    ) -> Self {
+        Self {
+            store,
+            alloc_table,
+            reverse_index_table,
+        }
     }
 }
 
@@ -686,6 +708,7 @@ impl<D: BlockSet + 'static> TxEventListenerFactory<RecordKey, RecordValue>
                 self.alloc_table.clone(),
                 self.store.clone(),
             )),
+            self.reverse_index_table.clone(),
         ))
     }
 }
@@ -694,13 +717,19 @@ impl<D: BlockSet + 'static> TxEventListenerFactory<RecordKey, RecordValue>
 struct TxLsmTreeListener<D> {
     tx_type: TxType,
     block_alloc: Arc<BlockAlloc<D>>,
+    reverse_index_table: Arc<ReverseIndexTable>,
 }
 
 impl<D> TxLsmTreeListener<D> {
-    fn new(tx_type: TxType, block_alloc: Arc<BlockAlloc<D>>) -> Self {
+    fn new(
+        tx_type: TxType,
+        block_alloc: Arc<BlockAlloc<D>>,
+        reverse_index_table: Arc<ReverseIndexTable>,
+    ) -> Self {
         Self {
             tx_type,
             block_alloc,
+            reverse_index_table,
         }
     }
 }
