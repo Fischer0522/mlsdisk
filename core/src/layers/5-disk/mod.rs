@@ -33,10 +33,10 @@
 
 mod bio;
 mod block_alloc;
-mod chunk_alloc;
 mod data_buf;
 mod gc;
 mod reverse_index;
+mod segment;
 mod sworndisk;
 
 pub use self::gc::{GreedyVictimPolicy, LoopScanVictimPolicy, VictimPolicy};

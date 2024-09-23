@@ -1,11 +1,11 @@
 use super::{
     block_alloc::{AllocTable, BlockAlloc},
-    chunk_alloc::{ChunkId, ChunkInfo},
     reverse_index::ReverseIndexTable,
+    segment::{Segment, SegmentId},
     sworndisk::{Hba, Lba, RecordKey, RecordValue},
 };
 use crate::{
-    layers::{disk::chunk_alloc::CHUNK_SIZE, lsm::TxLsmTree},
+    layers::{disk::segment::SEGMENT_SIZE, lsm::TxLsmTree},
     BlockSet, Error,
 };
 use crate::{
@@ -102,12 +102,12 @@ impl SharedState {
 }
 
 pub struct Victim {
-    chunk_id: ChunkId,
+    segment_id: SegmentId,
     blocks: Vec<Hba>,
 }
 
 pub trait VictimPolicy: Send + Sync {
-    fn pick_victim(&self, chunk_alloc_tables: &[ChunkInfo], threshold: f64) -> Option<Victim>;
+    fn pick_victim(&self, segment_table: &[Segment], threshold: f64) -> Option<Victim>;
 }
 
 pub type VictimPolicyRef = Arc<dyn VictimPolicy>;
@@ -115,11 +115,11 @@ pub type VictimPolicyRef = Arc<dyn VictimPolicy>;
 pub struct GreedyVictimPolicy {}
 
 impl VictimPolicy for GreedyVictimPolicy {
-    // pick the chunk with the maximum number of invalid blocks
-    fn pick_victim(&self, chunk_alloc_tables: &[ChunkInfo], threshold: f64) -> Option<Victim> {
+    // pick the segment with the maximum number of invalid blocks
+    fn pick_victim(&self, segment_table: &[Segment], threshold: f64) -> Option<Victim> {
         let mut max_num_invalid_blocks = 0;
         let mut victim = None;
-        chunk_alloc_tables
+        segment_table
             .iter()
             .enumerate()
             .for_each(|(i, alloc_table)| {
@@ -130,14 +130,14 @@ impl VictimPolicy for GreedyVictimPolicy {
                 {
                     max_num_invalid_blocks = alloc_table.num_invalid_blocks();
                     victim = Some(Victim {
-                        chunk_id: i,
+                        segment_id: i,
                         blocks: vec![],
                     });
                 }
             });
         victim.map(|mut victim| {
-            let victim_chunk = &chunk_alloc_tables[victim.chunk_id];
-            victim.blocks = victim_chunk.find_all_allocated_blocks();
+            let victim_segment = &segment_table[victim.segment_id];
+            victim.blocks = victim_segment.find_all_allocated_blocks();
             victim
         })
     }
@@ -156,21 +156,22 @@ impl LoopScanVictimPolicy {
 }
 
 impl VictimPolicy for LoopScanVictimPolicy {
-    fn pick_victim(&self, chunk_info_tables: &[ChunkInfo], threshold: f64) -> Option<Victim> {
+    fn pick_victim(&self, segment_table: &[Segment], threshold: f64) -> Option<Victim> {
         let last_cursor = self.cursor.load(Ordering::Relaxed);
         let mut cursor = last_cursor;
         loop {
-            cursor = (cursor + 1) % chunk_info_tables.len();
+            cursor = (cursor + 1) % segment_table.len();
             if cursor == last_cursor {
                 return None;
             }
-            let chunk = &chunk_info_tables[cursor];
-            let invalid_block_fraction = chunk.num_invalid_blocks() as f64 / chunk.nblocks() as f64;
+            let segment = &segment_table[cursor];
+            let invalid_block_fraction =
+                segment.num_invalid_blocks() as f64 / segment.nblocks() as f64;
             if invalid_block_fraction > threshold {
                 self.cursor.store(cursor, Ordering::Release);
                 return Some(Victim {
-                    chunk_id: cursor,
-                    blocks: chunk.find_all_allocated_blocks(),
+                    segment_id: cursor,
+                    blocks: segment.find_all_allocated_blocks(),
                 });
             }
         }
@@ -224,7 +225,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
     pub fn foreground_gc(&self) -> Result<()> {
         self.shared_state.wait_for_background_gc();
         let victim = self.victim_policy.pick_victim(
-            self.block_validity_table.get_chunk_info_table_ref(),
+            self.block_validity_table.get_segment_table_ref(),
             DEFAULT_GC_THRESHOLD,
         );
         if !self.trigger_gc(victim.as_ref()) {
@@ -240,23 +241,23 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         Ok(())
     }
 
-    // TODO: use tx to migrate data from victim to other chunk and update metadata
+    // TODO: use tx to migrate data from victim to other segment and update metadata
     pub fn background_gc(&self) -> Result<()> {
         // FIXME: use a cross-platform time function
         let start = std::time::Instant::now();
-        let mut chunk_ids = Vec::with_capacity(GC_WATERMARK);
+        let mut segment_ids = Vec::with_capacity(GC_WATERMARK);
         for _ in 0..GC_WATERMARK {
             let victim = self.victim_policy.pick_victim(
-                self.block_validity_table.get_chunk_info_table_ref(),
+                self.block_validity_table.get_segment_table_ref(),
                 DEFAULT_GC_THRESHOLD,
             );
 
-            // Generally, the VictimPolicy will pick a victim chunk that most needs GC
-            // if it returned None, it means there is no chunk needs GC, we can return
+            // Generally, the VictimPolicy will pick a victim segment that most needs GC
+            // if it returned None, it means there is no segment needs GC, we can return
             let Some(victim) = victim else {
                 break;
             };
-            chunk_ids.push(victim.chunk_id);
+            segment_ids.push(victim.segment_id);
             let (remapped_hbas, discard_hbas) = self.clean_and_migrate_data(victim)?;
 
             self.reverse_index_table.remap_index_batch(
@@ -268,9 +269,9 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         let duration = start.elapsed();
         #[cfg(not(feature = "linux"))]
         debug!(
-            "Background GC succeed, freed {} chunks, chunk_ids: {:?},took {:?}",
-            chunk_ids.len(),
-            chunk_ids,
+            "Background GC succeed, freed {} segments, segment_ids: {:?},took {:?}",
+            segment_ids.len(),
+            segment_ids,
             duration
         );
         Ok(())
@@ -281,7 +282,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         &self,
         victim: Victim,
     ) -> Result<(Vec<Hba>, Vec<(Lba, Hba)>, Vec<Hba>)> {
-        let victim_chunk = &self.block_validity_table.get_chunk_info_table_ref()[victim.chunk_id];
+        let victim_segment = &self.block_validity_table.get_segment_table_ref()[victim.segment_id];
 
         let (valid_hbas, discard_hbas) = victim.blocks.into_iter().try_fold(
             (Vec::new(), Vec::new()),
@@ -302,11 +303,11 @@ impl<D: BlockSet + 'static> GcWorker<D> {
 
         let mut target_hbas = Vec::new();
         let mut found_enough_blocks = false;
-        for chunk in self.block_validity_table.get_chunk_info_table_ref() {
-            if chunk.free_space() == 0 || chunk.chunk_id() == victim_chunk.chunk_id() {
+        for segment in self.block_validity_table.get_segment_table_ref() {
+            if segment.free_space() == 0 || segment.segment_id() == victim_segment.segment_id() {
                 continue;
             }
-            let free_hbas = chunk.find_all_free_blocks();
+            let free_hbas = segment.find_all_free_blocks();
             for hba in free_hbas {
                 if target_hbas.len() >= valid_hbas.len() {
                     found_enough_blocks = true;
@@ -326,12 +327,12 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         &self,
         victim: Victim,
     ) -> Result<(Vec<(Hba, Hba)>, Vec<(Lba, Hba)>)> {
-        let victim_chunk = &self.block_validity_table.get_chunk_info_table_ref()[victim.chunk_id];
+        let victim_segment = &self.block_validity_table.get_segment_table_ref()[victim.segment_id];
 
-        // TODO: use tx to migrate data from victim to other chunk ?
+        // TODO: use tx to migrate data from victim to other segment?
         let (valid_hbas, discard_hbas, free_hbas) = self.find_target_hbas(victim)?;
-        let mut victim_data = Buf::alloc(victim_chunk.nblocks())?;
-        let offset = victim_chunk.chunk_id() * CHUNK_SIZE;
+        let mut victim_data = Buf::alloc(victim_segment.nblocks())?;
+        let offset = victim_segment.segment_id() * SEGMENT_SIZE;
         self.user_data_disk.read(offset, victim_data.as_mut())?;
 
         let target_hba_batches = free_hbas.group_by(|hba1, hba2| hba2.saturating_sub(*hba1) == 1);
@@ -345,7 +346,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
                 let Some(victim_hba) = victim_hba_iter.next() else {
                     break;
                 };
-                let start = (victim_hba % CHUNK_SIZE) * BLOCK_SIZE;
+                let start = (victim_hba % SEGMENT_SIZE) * BLOCK_SIZE;
                 let end = start + BLOCK_SIZE;
 
                 let des_start = i * BLOCK_SIZE;
@@ -362,7 +363,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             .iter()
             .for_each(|hba| self.block_validity_table.set_allocated(*hba));
 
-        victim_chunk.clear_chunk();
+        victim_segment.clear_segment();
 
         Ok((
             valid_hbas.into_iter().zip(free_hbas).collect(),
@@ -377,8 +378,8 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         }
         #[cfg(not(feature = "linux"))]
         debug!(
-            "Triggered background GC, victim chunk: {}",
-            victim.unwrap().chunk_id
+            "Triggered background GC, victim segment: {}",
+            victim.unwrap().segment_id
         );
         true
     }
@@ -394,8 +395,8 @@ mod tests {
             bio::MemDisk,
             disk::{
                 block_alloc::{AllocTable, BlockAlloc},
-                chunk_alloc::{ChunkInfo, CHUNK_SIZE},
                 gc::{GreedyVictimPolicy, VictimPolicy},
+                segment::{Segment, SEGMENT_SIZE},
             },
             log::TxLogStore,
             lsm::{AsKV, SyncIdStore, TxEventListener, TxEventListenerFactory, TxLsmTree, TxType},
@@ -542,47 +543,47 @@ mod tests {
     #[test]
     fn greedy_victim_policy_test() {
         let bitmap = Arc::new(Mutex::new(BitMap::repeat(true, 3 * 1024)));
-        let chunk_alloc_tables = vec![
-            ChunkInfo::new(0, 1024, bitmap.clone()),
-            ChunkInfo::new(1, 1024, bitmap.clone()),
-            ChunkInfo::new(2, 1024, bitmap.clone()),
+        let segment_table = vec![
+            Segment::new(0, 1024, bitmap.clone()),
+            Segment::new(1, 1024, bitmap.clone()),
+            Segment::new(2, 1024, bitmap.clone()),
         ];
         let policy = GreedyVictimPolicy {};
-        let victim = policy.pick_victim(&chunk_alloc_tables, 0.);
+        let victim = policy.pick_victim(&segment_table, 0.);
         assert!(victim.is_none());
-        chunk_alloc_tables[1].mark_alloc();
-        // After dealloc, there will be an invalid block in the chunk, chunk 1 will be the victim
-        chunk_alloc_tables[1].mark_deallocated();
-        let victim = policy.pick_victim(&chunk_alloc_tables, 0.);
-        assert_eq!(victim.unwrap().chunk_id, 1);
+        segment_table[1].mark_alloc();
+        // After dealloc, there will be an invalid block in the segment, segment 1 will be the victim
+        segment_table[1].mark_deallocated();
+        let victim = policy.pick_victim(&segment_table, 0.);
+        assert_eq!(victim.unwrap().segment_id, 1);
     }
 
     #[test]
     fn threshold_test() {
         let bitmap = Arc::new(Mutex::new(BitMap::repeat(true, 3 * 1024)));
-        let chunk_alloc_tables = vec![
-            ChunkInfo::new(0, 1024, bitmap.clone()),
-            ChunkInfo::new(1, 1024, bitmap.clone()),
-            ChunkInfo::new(2, 1024, bitmap.clone()),
+        let segment_table = vec![
+            Segment::new(0, 1024, bitmap.clone()),
+            Segment::new(1, 1024, bitmap.clone()),
+            Segment::new(2, 1024, bitmap.clone()),
         ];
         let policy = GreedyVictimPolicy {};
         let threshold = 0.2;
-        let victim = policy.pick_victim(&chunk_alloc_tables, threshold);
+        let victim = policy.pick_victim(&segment_table, threshold);
         assert!(victim.is_none());
 
-        // deallocate enough blocks to pick the chunk as victim
-        for _ in 0..((2 * CHUNK_SIZE) as f64 * threshold) as usize {
-            chunk_alloc_tables[1].mark_alloc();
-            chunk_alloc_tables[1].mark_deallocated();
+        // deallocate enough blocks to pick the segment as victim
+        for _ in 0..((2 * SEGMENT_SIZE) as f64 * threshold) as usize {
+            segment_table[1].mark_alloc();
+            segment_table[1].mark_deallocated();
         }
-        let victim = policy.pick_victim(&chunk_alloc_tables, threshold);
-        assert_eq!(victim.unwrap().chunk_id, 1);
+        let victim = policy.pick_victim(&segment_table, threshold);
+        assert_eq!(victim.unwrap().segment_id, 1);
     }
 
     #[test]
     fn simple_data_migration() {
         init_logger();
-        let nblocks = 64 * CHUNK_SIZE;
+        let nblocks = 64 * SEGMENT_SIZE;
         let mem_disk = MemDisk::create(nblocks).unwrap();
         let greedy_victim_policy = GreedyVictimPolicy {};
         let root_key = AeadKey::random();
@@ -598,7 +599,7 @@ mod tests {
         let mut buf = Buf::alloc(1).unwrap();
         buf.as_mut_slice().copy_from_slice(&content);
 
-        // write enough blocks to trigger gc,[0-298] blocks is invalid chunk, only block 299 will be migrated
+        // write enough blocks to trigger gc,[0-298] blocks is invalid segment, only block 299 will be migrated
         for _ in 0..300 {
             disk.write(0, buf.as_ref()).unwrap();
             disk.sync().unwrap();
@@ -606,7 +607,7 @@ mod tests {
 
         gc_worker.background_gc().unwrap();
 
-        // after gc, the block at offset 0 should be migrated to another chunk
+        // after gc, the block at offset 0 should be migrated to another segment
         let mut read_buf = Buf::alloc(1).unwrap();
         disk.read(0, read_buf.as_mut()).unwrap();
         assert_eq!(read_buf.as_slice(), content);
@@ -615,7 +616,7 @@ mod tests {
     #[test]
     fn batch_data_migration() {
         init_logger();
-        let nblocks = 64 * CHUNK_SIZE;
+        let nblocks = 64 * SEGMENT_SIZE;
         let mem_disk = MemDisk::create(nblocks).unwrap();
         let greedy_victim_policy = GreedyVictimPolicy {};
         let root_key = AeadKey::random();
@@ -625,7 +626,7 @@ mod tests {
             .create_gc_worker(Arc::new(greedy_victim_policy))
             .unwrap();
 
-        // write enough blocks to trigger gc,[0-249] blocks is invalid chunk, 【250-550】 will be migrated
+        // write enough blocks to trigger gc,[0-249] blocks is invalid segment, 【250-550】 will be migrated
         for i in 0..300 {
             let content: Vec<u8> = vec![1 as u8; BLOCK_SIZE];
             let mut buf = Buf::alloc(1).unwrap();
@@ -658,6 +659,6 @@ mod tests {
             assert_eq!(read_buf.as_slice(), content, "block {} is not migrated", i);
         }
 
-        // after gc, the block at offset 0 should be migrated to another chunk
+        // after gc, the block at offset 0 should be migrated to another segment
     }
 }
