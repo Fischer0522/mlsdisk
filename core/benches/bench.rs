@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 fn main() {
+    util::init_logger();
     let total_bytes = 512 * MiB;
     // Specify all benchmarks
     let benches = vec![
@@ -250,7 +251,7 @@ mod benches {
                     ),
                     AeadKey::default(),
                     None,
-                    false,
+                    true,
                     None,
                 )?),
 
@@ -665,6 +666,14 @@ mod util {
     use super::*;
     use std::fmt::{self};
     use std::time::Duration;
+
+    pub fn init_logger() {
+        env_logger::builder()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Debug)
+            .try_init()
+            .unwrap();
+    }
 
     /// Display the amount of data in the unit of GiB, MiB, KiB, or bytes.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
