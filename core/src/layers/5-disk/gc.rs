@@ -139,11 +139,6 @@ impl VictimPolicy for GreedyVictimPolicy {
         victim.map(|mut victim| {
             let victim_segment = &segment_table[victim.segment_id];
             victim.blocks = victim_segment.find_all_allocated_blocks();
-            debug!(
-                "Picked victim segment: {}, valid_blocks: {:?}",
-                victim.segment_id,
-                victim_segment.num_valid_blocks()
-            );
             victim
         })
     }
@@ -241,12 +236,9 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             return Ok(());
         }
         // Safety: if victim is none, the function will return early
-        let (remapped_hbas, discard_hbas) = self.clean_and_migrate_data(victim.unwrap())?;
-        self.reverse_index_table.remap_index_batch(
-            remapped_hbas,
-            discard_hbas,
-            &self.logical_block_table,
-        )?;
+        let remapped_hbas = self.clean_and_migrate_data(victim.unwrap())?;
+        self.reverse_index_table
+            .remap_index_batch(remapped_hbas, &self.logical_block_table)?;
         Ok(())
     }
 
@@ -271,13 +263,10 @@ impl<D: BlockSet + 'static> GcWorker<D> {
 
             let mut tx = self.tx_provider.new_tx();
             let ret: Result<_> = tx.context(|| {
-                let (remapped_hbas, discard_hbas) = self.clean_and_migrate_data(victim)?;
+                let remapped_hbas = self.clean_and_migrate_data(victim)?;
 
-                self.reverse_index_table.remap_index_batch(
-                    remapped_hbas,
-                    discard_hbas,
-                    &self.logical_block_table,
-                )?;
+                self.reverse_index_table
+                    .remap_index_batch(remapped_hbas, &self.logical_block_table)?;
                 Ok(())
             });
             if ret.is_err() {
@@ -344,10 +333,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         Ok((valid_hbas, discard_hbas, target_hbas))
     }
 
-    pub fn clean_and_migrate_data(
-        &self,
-        victim: Victim,
-    ) -> Result<(Vec<(Hba, Hba)>, Vec<(Lba, Hba)>)> {
+    pub fn clean_and_migrate_data(&self, victim: Victim) -> Result<Vec<(Hba, Hba)>> {
         let victim_segment = &self.block_validity_table.get_segment_table_ref()[victim.segment_id];
 
         let (valid_hbas, discard_hbas, free_hbas) = self.find_target_hbas(victim)?;
@@ -383,10 +369,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         self.block_validity_table
             .clear_segment(victim_segment.segment_id(), discard_hbas.len());
 
-        Ok((
-            valid_hbas.into_iter().zip(free_hbas).collect(),
-            discard_hbas,
-        ))
+        Ok(valid_hbas.into_iter().zip(free_hbas).collect())
     }
 
     // TODO: Support more rules

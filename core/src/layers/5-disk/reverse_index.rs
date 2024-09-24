@@ -37,6 +37,11 @@ impl ReverseIndexTable {
         dealloc_table.remove(&lba);
     }
 
+    pub fn mark_deallocated(&self, lba: Lba, hba: Hba) {
+        let mut dealloc_table = self.dealloc_table.lock();
+        dealloc_table.insert(lba, hba);
+    }
+
     pub fn update_index_batch(&self, records: impl Iterator<Item = (RecordKey, RecordValue)>) {
         let mut index_table = self.index_table.lock();
         records.for_each(|(key, value)| {
@@ -52,7 +57,6 @@ impl ReverseIndexTable {
     pub fn remap_index_batch<D: BlockSet + 'static>(
         &self,
         remapped_hbas: Vec<(Hba, Hba)>,
-        discard_hbas: Vec<(Lba, Hba)>,
         tx_lsm_tree: &TxLsmTree<RecordKey, RecordValue, D>,
     ) -> Result<()> {
         let mut index_table = self.index_table.lock();
@@ -86,12 +90,6 @@ impl ReverseIndexTable {
                 index_table.remove(&old_hba);
                 Ok::<_, Error>(())
             })?;
-
-        // Access dealloc table after lsm to avoid deadlock
-        let mut dealloc_table = self.dealloc_table.lock();
-        discard_hbas.into_iter().for_each(|(lba, hba)| {
-            dealloc_table.insert(lba, hba);
-        });
         Ok::<_, Error>(())
     }
 
