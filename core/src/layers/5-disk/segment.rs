@@ -67,11 +67,13 @@ impl Segment {
     }
 
     pub fn mark_deallocated(&self) {
+        //  debug!("mark_deallocated: {}", self.segment_id);
         self.free_space.fetch_add(1, Ordering::Release);
         self.valid_block.fetch_sub(1, Ordering::Release);
     }
 
     pub fn mark_deallocated_batch(&self, nblocks: usize) {
+        //   debug!("mark_deallocated_batch: {}", self.segment_id);
         self.free_space.fetch_add(nblocks, Ordering::Release);
         self.valid_block.fetch_sub(nblocks, Ordering::Release);
     }
@@ -106,12 +108,6 @@ impl Segment {
     }
 
     pub fn clear_segment(&self) {
-        let mut guard = self.bitmap.lock();
-        let lower_bound = self.segment_id * SEGMENT_SIZE;
-        let upper_bound = lower_bound + self.nblocks;
-        for idx in lower_bound..upper_bound {
-            guard.set(idx, true);
-        }
         self.valid_block.store(self.nblocks, Ordering::Release);
         self.free_space.store(self.nblocks, Ordering::Release);
     }

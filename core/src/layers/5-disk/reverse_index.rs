@@ -75,6 +75,7 @@ impl ReverseIndexTable {
                     .expect("record key should exist in lsm tree");
 
                 // Update the hba of the record but keep the key and mac unchanged
+                // This will trigger deallocation of the old hba in MemTable
                 record_value.hba = new_hba;
 
                 // write the record back to lsm tree

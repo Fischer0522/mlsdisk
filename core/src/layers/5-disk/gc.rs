@@ -29,7 +29,7 @@ use core::{
 use hashbrown::{HashMap, HashSet};
 use log::debug;
 // Default gc interval time is 30 seconds
-const DEFAULT_GC_INTERVAL_TIME: std::time::Duration = std::time::Duration::from_secs(5);
+const DEFAULT_GC_INTERVAL_TIME: std::time::Duration = std::time::Duration::from_secs(3);
 const GC_WATERMARK: usize = 16;
 const DEFAULT_GC_THRESHOLD: f64 = 0.2;
 
@@ -139,6 +139,11 @@ impl VictimPolicy for GreedyVictimPolicy {
         victim.map(|mut victim| {
             let victim_segment = &segment_table[victim.segment_id];
             victim.blocks = victim_segment.find_all_allocated_blocks();
+            debug!(
+                "Picked victim segment: {}, valid_blocks: {:?}",
+                victim.segment_id,
+                victim_segment.num_valid_blocks()
+            );
             victim
         })
     }
@@ -250,6 +255,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         // FIXME: use a cross-platform time function
         let start = std::time::Instant::now();
         let mut segment_ids = Vec::with_capacity(GC_WATERMARK);
+
         for _ in 0..GC_WATERMARK {
             let victim = self.victim_policy.pick_victim(
                 self.block_validity_table.get_segment_table_ref(),
@@ -262,14 +268,25 @@ impl<D: BlockSet + 'static> GcWorker<D> {
                 break;
             };
             segment_ids.push(victim.segment_id);
-            let (remapped_hbas, discard_hbas) = self.clean_and_migrate_data(victim)?;
 
-            self.reverse_index_table.remap_index_batch(
-                remapped_hbas,
-                discard_hbas,
-                &self.logical_block_table,
-            )?;
+            let mut tx = self.tx_provider.new_tx();
+            let ret: Result<_> = tx.context(|| {
+                let (remapped_hbas, discard_hbas) = self.clean_and_migrate_data(victim)?;
+
+                self.reverse_index_table.remap_index_batch(
+                    remapped_hbas,
+                    discard_hbas,
+                    &self.logical_block_table,
+                )?;
+                Ok(())
+            });
+            if ret.is_err() {
+                tx.abort();
+                return Err(ret.err().unwrap());
+            }
+            tx.commit()?;
         }
+
         let duration = start.elapsed();
         #[cfg(not(feature = "linux"))]
         debug!(
@@ -333,48 +350,38 @@ impl<D: BlockSet + 'static> GcWorker<D> {
     ) -> Result<(Vec<(Hba, Hba)>, Vec<(Lba, Hba)>)> {
         let victim_segment = &self.block_validity_table.get_segment_table_ref()[victim.segment_id];
 
-        // TODO: use tx to migrate data from victim to other segment?
         let (valid_hbas, discard_hbas, free_hbas) = self.find_target_hbas(victim)?;
         let mut victim_data = Buf::alloc(victim_segment.nblocks())?;
         let offset = victim_segment.segment_id() * SEGMENT_SIZE;
         self.user_data_disk.read(offset, victim_data.as_mut())?;
 
-        let mut tx = self.tx_provider.new_tx();
-        let res: Result<()> = tx.context(|| {
-            let target_hba_batches =
-                free_hbas.group_by(|hba1, hba2| hba2.saturating_sub(*hba1) == 1);
-            let mut victim_hba_iter = valid_hbas.iter();
-            for target_hba_batch in target_hba_batches {
-                let batch_len = target_hba_batch.len();
-                let mut write_buf = Buf::alloc(batch_len)?;
+        let target_hba_batches = free_hbas.group_by(|hba1, hba2| hba2.saturating_sub(*hba1) == 1);
+        let mut victim_hba_iter = valid_hbas.iter();
+        for target_hba_batch in target_hba_batches {
+            let batch_len = target_hba_batch.len();
+            let mut write_buf = Buf::alloc(batch_len)?;
 
-                // read enough blocks to fill the batch
-                for i in 0..batch_len {
-                    let Some(victim_hba) = victim_hba_iter.next() else {
-                        break;
-                    };
-                    let start = (victim_hba % SEGMENT_SIZE) * BLOCK_SIZE;
-                    let end = start + BLOCK_SIZE;
+            // read enough blocks to fill the batch
+            for i in 0..batch_len {
+                let Some(victim_hba) = victim_hba_iter.next() else {
+                    break;
+                };
+                let start = (victim_hba % SEGMENT_SIZE) * BLOCK_SIZE;
+                let end = start + BLOCK_SIZE;
 
-                    let des_start = i * BLOCK_SIZE;
-                    let des_end = (i + 1) * BLOCK_SIZE;
-                    write_buf.as_mut_slice()[des_start..des_end]
-                        .copy_from_slice(&victim_data.as_slice()[start..end]);
-                }
-
-                self.user_data_disk
-                    .write(*target_hba_batch.first().unwrap(), write_buf.as_ref())?;
+                let des_start = i * BLOCK_SIZE;
+                let des_end = (i + 1) * BLOCK_SIZE;
+                write_buf.as_mut_slice()[des_start..des_end]
+                    .copy_from_slice(&victim_data.as_slice()[start..end]);
             }
 
-            free_hbas
-                .iter()
-                .for_each(|hba| self.block_validity_table.set_allocated(*hba));
+            self.user_data_disk
+                .write(*target_hba_batch.first().unwrap(), write_buf.as_ref())?;
+        }
 
-            victim_segment.clear_segment();
-            Ok(())
-        });
-        res?;
-        tx.commit()?;
+        self.block_validity_table.migrate_batch(&valid_hbas);
+        self.block_validity_table
+            .clear_segment(victim_segment.segment_id(), discard_hbas.len());
 
         Ok((
             valid_hbas.into_iter().zip(free_hbas).collect(),
@@ -394,13 +401,19 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         );
         true
     }
+
+    // fn clean_segment(&self, segment: &Segment) -> Result<()> {
+    //     segment.clear_segment();
+    //     self.block_validity_table.set_deallocated(nth);
+    // }
 }
 
 #[cfg(test)]
 mod tests {
-    use spin::Mutex;
-
     use super::*;
+    use crate::os::Rng;
+    use crate::util::Rng as UtilRng;
+    use crate::BlockId;
     use crate::{
         layers::{
             bio::MemDisk,
@@ -417,6 +430,7 @@ mod tests {
         AeadKey, RandomInit, SwornDisk,
     };
     use core::num::NonZeroUsize;
+    use spin::Mutex;
     use std::sync::{Arc, Once};
 
     static INIT_LOG: Once = Once::new();
@@ -429,6 +443,12 @@ mod tests {
                 .try_init()
                 .unwrap();
         });
+    }
+
+    fn gen_rnd_pos(total_nblocks: usize, buf_nblocks: usize) -> BlockId {
+        let mut rnd_pos_bytes = [0u8; 8];
+        Rng::new(&[]).fill_bytes(&mut rnd_pos_bytes).unwrap();
+        BlockId::from_le_bytes(rnd_pos_bytes) % (total_nblocks - buf_nblocks)
     }
 
     // I/O request will wait for background GC to finish
@@ -610,7 +630,7 @@ mod tests {
         let mut buf = Buf::alloc(1).unwrap();
         buf.as_mut_slice().copy_from_slice(&content);
 
-        // write enough blocks to trigger gc,[0-298] blocks is invalid segment, only block 299 will be migrated
+        // write enough blocks to trigger gc,[0-298] blocks are invalid, only block 299 will be migrated
         for _ in 0..300 {
             disk.write(0, buf.as_ref()).unwrap();
             disk.sync().unwrap();
@@ -637,7 +657,7 @@ mod tests {
             .create_gc_worker(Arc::new(greedy_victim_policy))
             .unwrap();
 
-        // write enough blocks to trigger gc,[0-249] blocks is invalid segment, 【250-550】 will be migrated
+        // write enough blocks to trigger gc,[0-249] blocks are invalid, [250-550] will be migrated
         for i in 0..300 {
             let content: Vec<u8> = vec![1 as u8; BLOCK_SIZE];
             let mut buf = Buf::alloc(1).unwrap();
@@ -671,5 +691,32 @@ mod tests {
         }
 
         // after gc, the block at offset 0 should be migrated to another segment
+    }
+
+    #[test]
+    fn multi_segment_migration() {
+        init_logger();
+        let nblocks = 64 * SEGMENT_SIZE;
+        let mem_disk = MemDisk::create(nblocks * 5 / 4).unwrap();
+        let greedy_victim_policy = GreedyVictimPolicy {};
+        let root_key = AeadKey::random();
+
+        let disk = SwornDisk::create(mem_disk, root_key, None, true, None).unwrap();
+        let gc_worker = disk
+            .create_gc_worker(Arc::new(greedy_victim_policy))
+            .unwrap();
+
+        let num_writes = 50000;
+
+        for i in 0..num_writes {
+            let content: Vec<u8> = vec![i as u8; BLOCK_SIZE];
+            let mut buf = Buf::alloc(1).unwrap();
+            buf.as_mut_slice().copy_from_slice(&content);
+            let block_id = gen_rnd_pos(nblocks, 1);
+            disk.write(block_id, buf.as_ref()).unwrap();
+        }
+        disk.sync().unwrap();
+
+        gc_worker.background_gc().unwrap();
     }
 }

@@ -670,6 +670,7 @@ mod util {
     pub fn init_logger() {
         env_logger::builder()
             .is_test(true)
+            .target(env_logger::Target::Stdout)
             .filter_level(log::LevelFilter::Debug)
             .try_init()
             .unwrap();

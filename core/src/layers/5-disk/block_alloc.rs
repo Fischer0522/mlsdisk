@@ -1,5 +1,5 @@
 //! Block allocation.
-use super::segment::{Segment, SEGMENT_SIZE};
+use super::segment::{self, Segment, SegmentId, SEGMENT_SIZE};
 use super::sworndisk::Hba;
 use crate::layers::bio::{BlockSet, Buf, BufRef, BID_SIZE};
 use crate::layers::log::{TxLog, TxLogStore};
@@ -285,12 +285,15 @@ impl AllocTable {
         Ok(())
     }
 
-    pub fn set_allocated(&self, nth: usize) {
-        let mut num_free = self.num_free.lock().unwrap();
-        self.bitmap.lock().set(nth, false);
-        let segment_id = nth / SEGMENT_SIZE;
-        self.segment_table[segment_id].mark_alloc();
-        *num_free -= 1;
+    // Migrate a batch of blocks to another segment.
+    // the blocks has been marked as allocated before, so the total num_free will not be decreased
+    pub fn migrate_batch(&self, hbas: &[Hba]) {
+        let mut bitmap = self.bitmap.lock();
+        hbas.iter().for_each(|hba| {
+            let segment_id = *hba / SEGMENT_SIZE;
+            self.segment_table[segment_id].mark_alloc();
+            bitmap.set(*hba, false);
+        });
     }
 
     /// Mark a specific slot deallocated.
@@ -299,7 +302,6 @@ impl AllocTable {
         self.bitmap.lock().set(nth, true);
 
         let segment_id = nth / SEGMENT_SIZE;
-        // TODO: remove this panic?
         self.segment_table[segment_id].mark_deallocated();
 
         *num_free += 1;
@@ -307,6 +309,19 @@ impl AllocTable {
         if *num_free >= AVG_ALLOC_COUNT {
             self.cvar.notify_one();
         }
+    }
+
+    // GC will deallocate out-of-date blocks before compaction
+    // discard these blocks and increase num_free
+    pub fn clear_segment(&self, segment_id: SegmentId, dealloc_count: usize) {
+        let mut bitmap = self.bitmap.lock();
+        let begin_hba = segment_id * SEGMENT_SIZE;
+        let end_hba = begin_hba + SEGMENT_SIZE;
+        for hba in begin_hba..end_hba {
+            bitmap.set(hba, true);
+        }
+        self.segment_table[segment_id].clear_segment();
+        *self.num_free.lock().unwrap() += dealloc_count;
     }
 
     pub fn get_segment_table_ref(&self) -> &[Segment] {
