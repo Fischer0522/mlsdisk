@@ -597,7 +597,7 @@ mod tests {
     #[test]
     fn simple_data_migration() {
         init_logger();
-        let nblocks = 64 * SEGMENT_SIZE;
+        let nblocks = 128 * SEGMENT_SIZE;
         let mem_disk = MemDisk::create(nblocks).unwrap();
         let greedy_victim_policy = GreedyVictimPolicy {};
         let root_key = AeadKey::random();
@@ -630,7 +630,7 @@ mod tests {
     #[test]
     fn batch_data_migration() {
         init_logger();
-        let nblocks = 64 * SEGMENT_SIZE;
+        let nblocks = 128 * SEGMENT_SIZE;
         let mem_disk = MemDisk::create(nblocks).unwrap();
         let greedy_victim_policy = GreedyVictimPolicy {};
         let root_key = AeadKey::random();
@@ -679,7 +679,7 @@ mod tests {
     #[test]
     fn multi_segment_migration() {
         init_logger();
-        let nblocks = 64 * SEGMENT_SIZE;
+        let nblocks = 128 * SEGMENT_SIZE;
         let mem_disk = MemDisk::create(nblocks * 5 / 4).unwrap();
         let greedy_victim_policy = GreedyVictimPolicy {};
         let root_key = AeadKey::random();

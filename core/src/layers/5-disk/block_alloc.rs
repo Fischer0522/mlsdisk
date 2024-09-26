@@ -156,7 +156,7 @@ impl AllocTable {
             let seg_log_res = store.open_log_in(BUCKET_SEGMENT_TABLE);
             let segment_table = match seg_log_res {
                 Ok(seg_log) => {
-                    let mut buf = Buf::alloc(segment_nums * Segment::ser_size())?;
+                    let mut buf = Buf::alloc(seg_log.nblocks())?;
                     seg_log.read(0 as BlockId, buf.as_mut())?;
                     recover_segment_table(segment_nums, buf.as_slice(), bitmap)?
                 }
@@ -288,14 +288,18 @@ impl AllocTable {
         // Serialize the segment table, [valid_block, free_space]
         // Persist the serialized segment table to `SEG` log
         let mut ser_seg_buf = vec![0; Segment::ser_size() * segment_table_len];
+        let mut ser_len = 0;
         self.segment_table
             .iter()
             .enumerate()
             .try_for_each(|(idx, segment)| {
                 let offset = idx * Segment::ser_size();
                 let segment_buf = &mut ser_seg_buf[offset..offset + Segment::ser_size()];
-                segment.to_slice(segment_buf)
+                ser_len += segment.to_slice(segment_buf)?;
+                Ok::<_, Error>(())
             })?;
+
+        ser_seg_buf.resize(align_up(ser_len, BLOCK_SIZE), 0);
         // Persist the serialized block validity table to `BVT` log
         // and GC any old `BVT` logs and `BAL` logs
         let mut tx = store.new_tx();
@@ -303,6 +307,12 @@ impl AllocTable {
             if let Ok(bvt_log_ids) = store.list_logs_in(BUCKET_BLOCK_VALIDITY_TABLE) {
                 for bvt_log_id in bvt_log_ids {
                     store.delete_log(bvt_log_id)?;
+                }
+            }
+
+            if let Ok(seg_log_ids) = store.list_logs_in(BUCKET_SEGMENT_TABLE) {
+                for seg_log_id in seg_log_ids {
+                    store.delete_log(seg_log_id)?;
                 }
             }
 

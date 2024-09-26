@@ -115,13 +115,14 @@ impl Segment {
 }
 
 impl Segment {
-    pub fn to_slice(&self, buf: &mut [u8]) -> Result<()> {
+    pub fn to_slice(&self, buf: &mut [u8]) -> Result<usize> {
         let valid_blocks = self.num_valid_blocks();
         let free_space = self.free_space();
         let data = [valid_blocks, free_space];
-        postcard::to_slice::<[usize; 2]>(&data, buf)
-            .map_err(|_| Error::with_msg(InvalidArgs, "serialize segment failed"))?;
-        Ok(())
+        let ser_len = postcard::to_slice::<[usize; 2]>(&data, buf)
+            .map_err(|_| Error::with_msg(InvalidArgs, "serialize segment failed"))?
+            .len();
+        Ok(ser_len)
     }
 
     pub fn recover(
