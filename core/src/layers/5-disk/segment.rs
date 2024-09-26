@@ -4,6 +4,7 @@ use crate::layers::log::{TxLog, TxLogStore};
 use crate::os::{BTreeMap, Mutex};
 use crate::util::BitMap;
 use crate::{prelude::*, BlockSet, Errno};
+use core::mem::size_of;
 use core::sync::atomic::{AtomicUsize, Ordering};
 // Each segment contains 1024 blocks
 pub const SEGMENT_SIZE: usize = 1024;
@@ -113,11 +114,60 @@ impl Segment {
     }
 }
 
+impl Segment {
+    pub fn to_slice(&self, buf: &mut [u8]) -> Result<()> {
+        let valid_blocks = self.num_valid_blocks();
+        let free_space = self.free_space();
+        let data = [valid_blocks, free_space];
+        postcard::to_slice::<[usize; 2]>(&data, buf)
+            .map_err(|_| Error::with_msg(InvalidArgs, "serialize segment failed"))?;
+        Ok(())
+    }
+
+    pub fn recover(
+        segment_id: SegmentId,
+        buf: &[u8],
+        bitmap: Arc<Mutex<BitMap>>,
+        nblocks: usize,
+    ) -> Result<Self> {
+        let ret = postcard::from_bytes::<[usize; 2]>(buf)
+            .map_err(|_| Error::with_msg(InvalidArgs, "deserialize segment failed"))?;
+        let valid_blocks = ret[0];
+        let free_space = ret[1];
+        Ok(Self {
+            valid_block: AtomicUsize::new(valid_blocks),
+            free_space: AtomicUsize::new(free_space),
+            bitmap,
+            nblocks,
+            segment_id,
+        })
+    }
+
+    pub fn ser_size() -> usize {
+        size_of::<usize>() * 2
+    }
+}
+
+pub fn recover_segment_table(
+    capacity: usize,
+    buf: &[u8],
+    bitmap: Arc<Mutex<BitMap>>,
+) -> Result<Vec<Segment>> {
+    let mut segment_table = Vec::with_capacity(capacity);
+    for idx in 0..capacity {
+        let offset = idx * Segment::ser_size();
+        let segment_buf = &buf[offset..offset + Segment::ser_size()];
+        let segment = Segment::recover(idx, segment_buf, bitmap.clone(), SEGMENT_SIZE)?;
+        segment_table.push(segment);
+    }
+    Ok(segment_table)
+}
+
 #[cfg(test)]
 mod tests {
-    use hashbrown::HashSet;
-
     use super::*;
+    use core::mem::size_of;
+    use hashbrown::HashSet;
 
     #[test]
     fn test_segment_alloc_table() {
@@ -178,5 +228,50 @@ mod tests {
         assert_eq!(segments[0].find_all_allocated_blocks().len(), 2);
         assert_eq!(segments[1].find_all_allocated_blocks().len(), 3);
         assert_eq!(segments[2].find_all_allocated_blocks().len(), 0);
+    }
+
+    #[test]
+    fn recover_segment() {
+        let bitmap = Arc::new(Mutex::new(BitMap::repeat(true, 3 * 1024)));
+        let segment = Segment::new(0, 1024, bitmap.clone());
+        segment.mark_alloc();
+        segment.mark_alloc();
+        segment.mark_deallocated();
+        // valid_blocks: 1023, free_space: 1023
+        let mut buf = vec![0; 2 * size_of::<usize>()];
+        segment.to_slice(&mut buf).unwrap();
+        let recovered_segment = Segment::recover(0, &buf, bitmap, 1024).unwrap();
+        assert_eq!(recovered_segment.num_valid_blocks(), 1023);
+        assert_eq!(recovered_segment.free_space(), 1023);
+    }
+
+    #[test]
+    fn recover_multi_segments() {
+        let bitmap = Arc::new(Mutex::new(BitMap::repeat(true, 3 * 1024)));
+        let segments = vec![
+            Segment::new(0, 1024, bitmap.clone()),
+            Segment::new(1, 1024, bitmap.clone()),
+            Segment::new(2, 1024, bitmap.clone()),
+        ];
+        segments[0].mark_alloc_batch(2);
+        segments[0].mark_deallocated();
+        segments[1].mark_alloc_batch(3);
+        segments[1].mark_deallocated();
+        segments[2].mark_alloc_batch(4);
+
+        let mut buf = vec![0; Segment::ser_size() * 3];
+        for (idx, segment) in segments.iter().enumerate() {
+            let offset = idx * Segment::ser_size();
+            let segment_buf = &mut buf[offset..offset + Segment::ser_size()];
+            segment.to_slice(segment_buf).unwrap();
+        }
+        let recovered_segments = recover_segment_table(3, buf.as_slice(), bitmap).unwrap();
+        assert_eq!(recovered_segments.len(), 3);
+        assert_eq!(recovered_segments[0].num_valid_blocks(), 1023);
+        assert_eq!(recovered_segments[0].free_space(), 1023);
+        assert_eq!(recovered_segments[1].num_valid_blocks(), 1023);
+        assert_eq!(recovered_segments[1].free_space(), 1022);
+        assert_eq!(recovered_segments[2].num_valid_blocks(), 1024);
+        assert_eq!(recovered_segments[2].free_space(), 1020);
     }
 }
