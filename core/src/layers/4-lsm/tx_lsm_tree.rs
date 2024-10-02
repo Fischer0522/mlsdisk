@@ -578,6 +578,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             let sync_id = immutable_memtable.sync_id();
 
             let sst = SSTable::build(records_iter, sync_id, &tx_log, Some(&event_listener))?;
+            // FIXME: Delete wal when all column families's memtable is flushed
             self.tx_log_store.delete_log(wal_id)?;
             Ok(sst)
         });
@@ -1141,6 +1142,13 @@ mod tests {
         // Put sufficient records which can trigger compaction before a sync command
         let cap = MEMTABLE_CAPACITY;
         let start = 0;
+        let col_key = 500;
+        let col_val = Value {
+            hba: col_key as BlockId,
+            key: Key::random(),
+            mac: Mac::random(),
+        };
+        tx_lsm_tree.put(col_key, col_val, Some(ColumnFamily::ReverseIndex))?;
         for i in start..start + cap {
             let (k, v) = (
                 i as BlockId,
@@ -1159,6 +1167,11 @@ mod tests {
 
         let target_value = tx_lsm_tree.get(&500, None).unwrap();
         assert_eq!(target_value.hba, 500);
+
+        let target_col_value = tx_lsm_tree
+            .get(&500, Some(ColumnFamily::ReverseIndex))
+            .unwrap();
+        assert_eq!(target_col_value.hba, 500);
 
         // Put sufficient records which can trigger compaction after a sync command
         let start = 500;
@@ -1197,6 +1210,53 @@ mod tests {
         let res = range_query_ctx.into_results();
         assert_eq!(res[0].1.hba, 500);
         assert_eq!(res[cnt - 1].1.hba, 500 + cnt - 1);
+        Ok(())
+    }
+
+    #[test]
+    fn diff_column_families() -> Result<()> {
+        let nblocks = 102400;
+        let mem_disk = MemDisk::create(nblocks)?;
+        let tx_log_store = Arc::new(TxLogStore::format(mem_disk, Key::random())?);
+        let tx_lsm_tree: TxLsmTree<BlockId, Value, MemDisk> = TxLsmTree::format(
+            tx_log_store.clone(),
+            Arc::new(Factory),
+            None,
+            None,
+            Arc::new(SharedState::new()),
+        )?;
+
+        let col_key = 500;
+        let col_val = Value {
+            hba: col_key as BlockId,
+            key: Key::random(),
+            mac: Mac::random(),
+        };
+        tx_lsm_tree.put(col_key, col_val, Some(ColumnFamily::ReverseIndex))?;
+
+        let default_key = 100;
+        let default_val = Value {
+            hba: default_key as BlockId,
+            key: Key::random(),
+            mac: Mac::random(),
+        };
+        tx_lsm_tree.put(default_key, default_val, None)?;
+
+        tx_lsm_tree.sync()?;
+
+        let target_value = tx_lsm_tree
+            .get(&500, Some(ColumnFamily::ReverseIndex))
+            .unwrap();
+        assert_eq!(target_value.hba, 500);
+
+        let target_value = tx_lsm_tree.get(&100, None).unwrap();
+        assert_eq!(target_value.hba, 100);
+
+        let ret = tx_lsm_tree.get(&100, Some(ColumnFamily::ReverseIndex));
+        assert!(ret.is_err());
+        let ret = tx_lsm_tree.get(&500, None);
+        assert!(ret.is_err());
+
         Ok(())
     }
 }
