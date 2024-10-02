@@ -5,7 +5,10 @@ use super::{
     sworndisk::{Hba, Lba, RecordKey, RecordValue},
 };
 use crate::{
-    layers::{disk::segment::SEGMENT_SIZE, lsm::TxLsmTree},
+    layers::{
+        disk::segment::SEGMENT_SIZE,
+        lsm::{ColumnFamily, TxLsmTree},
+    },
     tx::TxProvider,
     BlockSet, Error,
 };
@@ -300,9 +303,14 @@ impl<D: BlockSet + 'static> GcWorker<D> {
                 // if victim hba is different from the hba that stored in logical block table,
                 // it means the block is already invalid but not deallocated by compaction,
                 // it should be discarded and be marked to avoid double free
-                let lba = self.reverse_index_table.get_lba(&hba);
-                let old_hba = self.logical_block_table.get(&RecordKey { lba })?;
-                if hba == old_hba.hba {
+                //let lba = self.reverse_index_table.get_lba(&hba);
+                let reverse_index_key = RecordKey { lba: hba };
+                let lba = self
+                    .logical_block_table
+                    .get(&reverse_index_key, Some(ColumnFamily::ReverseIndex))?
+                    .hba;
+                let old_hba = self.logical_block_table.get(&RecordKey { lba }, None)?.hba;
+                if hba == old_hba {
                     valid.push(hba);
                 } else {
                     discard.push((lba, hba));

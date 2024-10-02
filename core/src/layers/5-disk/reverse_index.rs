@@ -1,6 +1,9 @@
 use log::debug;
+use pod::Pod;
 
 use super::sworndisk::{Hba, Lba, RecordKey, RecordValue};
+use crate::layers::crypto::{Key, Mac};
+use crate::layers::lsm::ColumnFamily;
 use crate::prelude::{Error, Result, Vec};
 use crate::{
     layers::lsm::TxLsmTree,
@@ -8,24 +11,14 @@ use crate::{
     BlockSet,
 };
 pub(super) struct ReverseIndexTable {
-    index_table: Mutex<BTreeMap<Hba, Lba>>,
     dealloc_table: Mutex<HashMap<Lba, Hba>>,
 }
 
 impl ReverseIndexTable {
     pub fn new() -> Self {
         Self {
-            index_table: Mutex::new(BTreeMap::new()),
             dealloc_table: Mutex::new(HashMap::new()),
         }
-    }
-
-    pub fn get_lba(&self, old_hba: &Hba) -> Lba {
-        let index_table = self.index_table.lock();
-        index_table
-            .get(&old_hba)
-            .map(|lba| *lba)
-            .expect("hba should exist in index table")
     }
 
     pub fn has_deallocated(&self, lba: Lba) -> bool {
@@ -42,13 +35,6 @@ impl ReverseIndexTable {
         dealloc_table.insert(lba, hba);
     }
 
-    pub fn update_index_batch(&self, records: impl Iterator<Item = (RecordKey, RecordValue)>) {
-        let mut index_table = self.index_table.lock();
-        records.for_each(|(key, value)| {
-            index_table.insert(value.hba, key.lba);
-        });
-    }
-
     // TODO use btree_map::range to get hbas from index table in batch
     // After data migration in GC task, we need:
     // 1. update the hba of the records in lsm tree
@@ -59,23 +45,22 @@ impl ReverseIndexTable {
         remapped_hbas: Vec<(Hba, Hba)>,
         tx_lsm_tree: &TxLsmTree<RecordKey, RecordValue, D>,
     ) -> Result<()> {
-        let mut index_table = self.index_table.lock();
-
         remapped_hbas
             .into_iter()
             .try_for_each(|(old_hba, new_hba)| {
                 // Get the lba of the old hba
                 // Safety: hba should exist in index table, otherwise it means system is inconsistent
-                let lba = index_table
-                    .get(&old_hba)
-                    .map(|lba| *lba)
+                let key = RecordKey { lba: old_hba };
+                let lba = tx_lsm_tree
+                    .get(&key, Some(ColumnFamily::ReverseIndex))
+                    .map(|lba| lba.hba)
                     .expect("hba should exist in index table");
                 let record_key = RecordKey { lba };
 
                 // get mac and key of the old hba record
                 // Safety: hba should exist in lsm tree, otherwise it means system is inconsistent
                 let mut record_value = tx_lsm_tree
-                    .get(&record_key)
+                    .get(&record_key, None)
                     .expect("record key should exist in lsm tree");
 
                 // Update the hba of the record but keep the key and mac unchanged
@@ -83,11 +68,21 @@ impl ReverseIndexTable {
                 record_value.hba = new_hba;
 
                 // write the record back to lsm tree
-                tx_lsm_tree.put(record_key, record_value)?;
+                tx_lsm_tree.put(record_key, record_value, None)?;
+
+                let reverse_index_key = RecordKey { lba: new_hba };
 
                 // update the reverse index table
-                index_table.insert(new_hba, lba);
-                index_table.remove(&old_hba);
+                let reverse_index_value = RecordValue {
+                    hba: lba,
+                    key: Key::new_uninit(),
+                    mac: Mac::new_uninit(),
+                };
+                tx_lsm_tree.put(
+                    reverse_index_key,
+                    reverse_index_value,
+                    Some(ColumnFamily::ReverseIndex),
+                )?;
                 Ok::<_, Error>(())
             })?;
         Ok::<_, Error>(())

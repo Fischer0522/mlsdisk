@@ -2,7 +2,7 @@
 use super::mem_table::ValueEx;
 use super::sstable::SSTable;
 use super::tx_lsm_tree::SSTABLE_CAPACITY;
-use super::{LsmLevel, RecordKey, RecordValue, SyncId, TxEventListener};
+use super::{ColumnFamily, LsmLevel, RecordKey, RecordValue, SyncId, TxEventListener};
 use crate::layers::bio::BlockSet;
 use crate::layers::log::TxLogStore;
 use crate::os::{JoinHandle, Mutex};
@@ -54,6 +54,7 @@ impl<K: RecordKey<K>, V: RecordValue> Compactor<K, V> {
         event_listener: &Arc<dyn TxEventListener<K, V>>,
         to_level: LsmLevel,
         sync_id: SyncId,
+        column_family: Option<ColumnFamily>,
     ) -> Result<Vec<SSTable<K, V>>> {
         let mut created_ssts = Vec::new();
         let mut upper_iter = upper_records.peekable();
@@ -93,7 +94,7 @@ impl<K: RecordKey<K>, V: RecordValue> Compactor<K, V> {
                 break;
             }
 
-            let new_log = tx_log_store.create_log(to_level.bucket())?;
+            let new_log = tx_log_store.create_log(to_level.bucket(column_family))?;
             let new_sst = SSTable::build(records_iter, sync_id, &new_log, None)?;
 
             created_ssts.push(new_sst);

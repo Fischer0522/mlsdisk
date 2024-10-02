@@ -16,8 +16,8 @@ use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
 use crate::layers::disk::gc::{GreedyVictimPolicy, SharedState};
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
-    AsKV, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, SyncIdStore,
-    TxEventListener, TxEventListenerFactory, TxLsmTree, TxType,
+    AsKV, ColumnFamily, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV,
+    SyncIdStore, TxEventListener, TxEventListenerFactory, TxLsmTree, TxType,
 };
 use crate::os::{
     Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, BTreeMap, Condvar, CvarMutex, RwLock,
@@ -357,7 +357,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
         self.wait_for_background_gc();
         // Search in `TxLsmTree` then
-        let value = self.logical_block_table.get(&RecordKey { lba })?;
+        let value = self.logical_block_table.get(&RecordKey { lba }, None)?;
 
         // Perform disk read and decryption
         let mut cipher = Buf::alloc(1)?;
@@ -397,7 +397,8 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         self.wait_for_background_gc();
 
         // Search in `TxLsmTree` then
-        self.logical_block_table.get_range(&mut range_query_ctx)?;
+        self.logical_block_table
+            .get_range(&mut range_query_ctx, None)?;
         // Allow empty read
         debug_assert!(range_query_ctx.is_completed());
 
@@ -465,12 +466,23 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         // Insert new records of data blocks to `TxLsmTree`
         for (key, value) in records.iter() {
             // TODO: Error handling: Should dealloc the written blocks
-            self.logical_block_table.put(key.clone(), value.clone())?;
+            self.logical_block_table
+                .put(key.clone(), value.clone(), None)?;
+            let reverse_index_key = RecordKey { lba: value.hba };
+            let reverse_index_value = RecordValue {
+                hba: key.lba,
+                key: value.key,
+                mac: value.mac,
+            };
+            self.logical_block_table.put(
+                reverse_index_key,
+                reverse_index_value,
+                Some(ColumnFamily::ReverseIndex),
+            )?;
         }
 
         // Update reverse index table
-        self.reverse_index_table
-            .update_index_batch(records.into_iter());
+
         self.data_buf.clear();
         Ok(())
     }
