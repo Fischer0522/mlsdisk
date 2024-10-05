@@ -88,6 +88,8 @@ impl SharedState {
     }
 
     pub fn start_compaction(&self) {
+        #[cfg(not(feature = "linux"))]
+        debug!("Background compaction started");
         let mut compaction_in_progress = self.compaction_in_progress.lock().unwrap();
         *compaction_in_progress = true;
     }
@@ -99,6 +101,8 @@ impl SharedState {
     }
 
     pub fn notify_compaction_finished(&self) {
+        #[cfg(not(feature = "linux"))]
+        debug!("Background compaction finished");
         let mut compaction_in_progress = self.compaction_in_progress.lock().unwrap();
         *compaction_in_progress = false;
         self.compaction_condvar.notify_all();

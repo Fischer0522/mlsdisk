@@ -55,6 +55,18 @@ pub enum ColumnFamily {
     ReverseIndex,
 }
 
+impl TryFrom<u8> for ColumnFamily {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(ColumnFamily::Default),
+            1 => Ok(ColumnFamily::ReverseIndex),
+            _ => Err(Error::new(InvalidArgs)),
+        }
+    }
+}
+
 /// Levels in a `TxLsmTree`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum LsmLevel {
@@ -210,7 +222,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         let record = (key, value);
 
         // Write the record to WAL
-        inner.wal_append_tx.append(&record)?;
+        inner.wal_append_tx.append(&record, column_family)?;
 
         let memtable_manager = inner.get_memtable_manager(column_family);
 
@@ -245,6 +257,8 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         let inner = self.0.clone();
         let handle = spawn(move || -> Result<()> {
             // Wait for background GC to finish
+            #[cfg(not(feature = "linux"))]
+            debug!("Compaction TX: waiting for background GC to finish");
             inner.shared_state.wait_for_background_gc();
             inner.shared_state.start_compaction();
             // Do major compaction first if necessary
@@ -326,11 +340,11 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
         let memtable_manager = Self::recover_memtable_manager(
             sync_id,
-            synced_records.clone().into_iter(),
+            synced_records[0].clone().into_iter(),
             on_drop_record_in_memtable,
         );
         let reverse_index_memtable_manager =
-            Self::recover_memtable_manager(sync_id, synced_records.into_iter(), None);
+            Self::recover_memtable_manager(sync_id, synced_records[1].clone().into_iter(), None);
         let memtable_managers = vec![memtable_manager, reverse_index_memtable_manager];
 
         let recov_self = Self {
@@ -352,7 +366,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
     }
 
     /// Recover the synced records and the maximum sync ID from the latest WAL.
-    fn recover_from_wal(tx_log_store: &Arc<TxLogStore<D>>) -> Result<(Vec<(K, V)>, SyncId)> {
+    fn recover_from_wal(tx_log_store: &Arc<TxLogStore<D>>) -> Result<(Vec<Vec<(K, V)>>, SyncId)> {
         let mut tx = tx_log_store.new_tx();
         let res: Result<_> = tx.context(|| {
             let wal_res = tx_log_store.open_log_in(BUCKET_WAL);
@@ -1087,9 +1101,12 @@ mod tests {
         layers::{
             bio::{Buf, MemDisk},
             disk::SharedState,
+            log::TxLogStore,
+            lsm::wal::BUCKET_WAL,
         },
         os::{AeadKey as Key, AeadMac as Mac},
     };
+    use std::sync::Arc;
 
     struct Factory;
     struct Listener;
@@ -1256,6 +1273,75 @@ mod tests {
         assert!(ret.is_err());
         let ret = tx_lsm_tree.get(&500, None);
         assert!(ret.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn recover_from_wal() -> Result<()> {
+        let nblocks = 102400;
+        let mem_disk = MemDisk::create(nblocks)?;
+        let tx_log_store = Arc::new(TxLogStore::format(mem_disk, Key::random())?);
+        let tx_lsm_tree: TxLsmTree<BlockId, Value, MemDisk> = TxLsmTree::format(
+            tx_log_store.clone(),
+            Arc::new(Factory),
+            None,
+            None,
+            Arc::new(SharedState::new()),
+        )?;
+
+        let start = 0;
+        let cap = 100;
+        for i in start..start + cap {
+            let (k, v) = (
+                i as BlockId,
+                Value {
+                    hba: i as BlockId,
+                    key: Key::random(),
+                    mac: Mac::random(),
+                },
+            );
+            tx_lsm_tree.put(k, v, None)?;
+        }
+
+        let start = 100;
+        for i in start..start + cap {
+            let (k, v) = (
+                i as BlockId,
+                Value {
+                    hba: i as BlockId,
+                    key: Key::random(),
+                    mac: Mac::random(),
+                },
+            );
+            tx_lsm_tree.put(k, v, Some(ColumnFamily::ReverseIndex))?;
+        }
+        tx_lsm_tree.sync()?;
+
+        // Recover the `TxLsmTree`, all unsynced records should be discarded
+        drop(tx_lsm_tree);
+        let tx_lsm_tree: TxLsmTree<BlockId, Value, MemDisk> = TxLsmTree::recover(
+            tx_log_store.clone(),
+            Arc::new(Factory),
+            None,
+            None,
+            Arc::new(SharedState::new()),
+        )?;
+
+        let start = 0;
+        let cap = 100;
+        for i in start..start + cap {
+            let target_value = tx_lsm_tree.get(&i, None).unwrap();
+            assert_eq!(target_value.hba, i);
+        }
+
+        let start = 100;
+        for i in start..start + cap {
+            let target_value = tx_lsm_tree
+                .get(&i, Some(ColumnFamily::ReverseIndex))
+                .unwrap();
+            assert_eq!(target_value.hba, i);
+        }
 
         Ok(())
     }
