@@ -34,8 +34,8 @@
 mod bio;
 mod block_alloc;
 mod data_buf;
+mod dealloc_block;
 mod gc;
-mod reverse_index;
 mod segment;
 mod sworndisk;
 

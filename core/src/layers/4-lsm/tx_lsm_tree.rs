@@ -13,15 +13,13 @@ use super::wal::{WalAppendTx, BUCKET_WAL};
 use crate::layers::bio::BlockSet;
 use crate::layers::disk::SharedStateRef;
 use crate::layers::log::{TxLogId, TxLogStore};
-
 use crate::os::{spawn, BTreeMap, RwLock};
 use crate::prelude::*;
 use crate::tx::Tx;
-
 use core::default;
 use core::hash::Hash;
 use core::ops::{Add, RangeInclusive, Sub};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use pod::Pod;
 
 /// Monotonic incrementing sync ID.
@@ -37,10 +35,8 @@ pub struct TxLsmTree<K: RecordKey<K>, V, D>(Arc<TreeInner<K, V, D>>);
 
 /// Inner structures of `TxLsmTree`.
 pub(super) struct TreeInner<K: RecordKey<K>, V, D> {
-    memtable_manager: Vec<MemTableManager<K, V>>,
-    sst_manager: Vec<RwLock<SstManager<K, V>>>,
+    column_family_manager: ColumnFamilyManager<K, V>,
     wal_append_tx: WalAppendTx<D>,
-    compactor: Vec<Compactor<K, V>>,
     tx_log_store: Arc<TxLogStore<D>>,
     listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
     master_sync_id: MasterSyncId,
@@ -53,6 +49,180 @@ pub enum ColumnFamily {
     #[default]
     Default = 0,
     ReverseIndex,
+}
+
+pub struct ColumnFamilyData<K: RecordKey<K>, V> {
+    memtable_manager: MemTableManager<K, V>,
+    sst_manager: RwLock<SstManager<K, V>>,
+    compactor: Compactor<K, V>,
+    version: AtomicUsize,
+}
+
+pub struct ColumnFamilyManager<K: RecordKey<K>, V> {
+    inner: Vec<ColumnFamilyData<K, V>>,
+}
+
+// TODO: support dynamic size
+impl<K: RecordKey<K>, V: RecordValue> ColumnFamilyManager<K, V> {
+    pub fn new(
+        sync_id: SyncId,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
+    ) -> Self {
+        let default_memtable_manager =
+            MemTableManager::new(sync_id, MEMTABLE_CAPACITY, on_drop_record_in_memtable);
+        let reverse_index_memtable_manager = MemTableManager::new(sync_id, MEMTABLE_CAPACITY, None);
+
+        let inner = vec![
+            ColumnFamilyData {
+                memtable_manager: default_memtable_manager,
+                sst_manager: RwLock::new(SstManager::new()),
+                compactor: Compactor::new(),
+                version: AtomicUsize::new(0),
+            },
+            ColumnFamilyData {
+                memtable_manager: reverse_index_memtable_manager,
+                sst_manager: RwLock::new(SstManager::new()),
+                compactor: Compactor::new(),
+                version: AtomicUsize::new(0),
+            },
+        ];
+        Self { inner }
+    }
+
+    pub fn recover<D: BlockSet + 'static>(
+        tx_log_store: &Arc<TxLogStore<D>>,
+        sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
+    ) -> Result<(Self, MasterSyncId)> {
+        let (synced_records, wal_sync_id) = Self::recover_from_wal(&tx_log_store)?;
+        let (sst_manager, ssts_sync_id) = Self::recover_sst_manager(&tx_log_store, None)?;
+
+        let (reverse_index_sst_manager, _) =
+            Self::recover_sst_manager(&tx_log_store, Some(ColumnFamily::ReverseIndex))?;
+
+        let max_sync_id = wal_sync_id.max(ssts_sync_id);
+        let master_sync_id = MasterSyncId::new(sync_id_store, max_sync_id)?;
+        let sync_id = master_sync_id.id();
+
+        let memtable_manager = Self::recover_memtable_manager(
+            sync_id,
+            synced_records[0].clone().into_iter(),
+            on_drop_record_in_memtable,
+        );
+        let reverse_index_memtable_manager =
+            Self::recover_memtable_manager(sync_id, synced_records[1].clone().into_iter(), None);
+
+        let inner = vec![
+            ColumnFamilyData {
+                memtable_manager,
+                sst_manager: RwLock::new(sst_manager),
+                compactor: Compactor::new(),
+                version: AtomicUsize::new(0),
+            },
+            ColumnFamilyData {
+                memtable_manager: reverse_index_memtable_manager,
+                sst_manager: RwLock::new(reverse_index_sst_manager),
+                compactor: Compactor::new(),
+                version: AtomicUsize::new(0),
+            },
+        ];
+        Ok((Self { inner }, master_sync_id))
+    }
+
+    fn get_sst_manager(&self, column_family: Option<ColumnFamily>) -> &RwLock<SstManager<K, V>> {
+        let idx = column_family.map(|cf| cf as usize).unwrap_or(0);
+        &self.inner[idx].sst_manager
+    }
+    fn get_memtable_manager(&self, column_family: Option<ColumnFamily>) -> &MemTableManager<K, V> {
+        let idx = column_family.map(|cf| cf as usize).unwrap_or(0);
+        &self.inner[idx].memtable_manager
+    }
+    fn get_compactor(&self, column_family: Option<ColumnFamily>) -> &Compactor<K, V> {
+        let idx = column_family.map(|cf| cf as usize).unwrap_or(0);
+        &self.inner[idx].compactor
+    }
+    fn compactors(&self) -> impl Iterator<Item = &Compactor<K, V>> {
+        self.inner.iter().map(|cf| &cf.compactor)
+    }
+
+    fn memtable_managers(&self) -> impl Iterator<Item = &MemTableManager<K, V>> {
+        self.inner.iter().map(|cf| &cf.memtable_manager)
+    }
+
+    /// Recover the synced records and the maximum sync ID from the latest WAL.
+    fn recover_from_wal<D: BlockSet + 'static>(
+        tx_log_store: &Arc<TxLogStore<D>>,
+    ) -> Result<(Vec<Vec<(K, V)>>, SyncId)> {
+        let mut tx = tx_log_store.new_tx();
+        let res: Result<_> = tx.context(|| {
+            let wal_res = tx_log_store.open_log_in(BUCKET_WAL);
+            if let Err(e) = &wal_res
+                && e.errno() == NotFound
+            {
+                return Ok((vec![], 0));
+            }
+            let wal = wal_res?;
+            // Only synced records count, all unsynced are discarded
+            WalAppendTx::collect_synced_records_and_sync_id::<K, V>(&wal)
+        });
+        if res.is_ok() {
+            tx.commit()?;
+        } else {
+            tx.abort();
+            return_errno_with_msg!(TxAborted, "recover from WAL failed");
+        }
+        res
+    }
+
+    /// Recover `MemTable` from the given synced records.
+    fn recover_memtable_manager(
+        sync_id: SyncId,
+        synced_records: impl Iterator<Item = (K, V)>,
+        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
+    ) -> MemTableManager<K, V> {
+        let memtable_manager =
+            MemTableManager::new(sync_id, MEMTABLE_CAPACITY, on_drop_record_in_memtable);
+        synced_records.into_iter().for_each(|(k, v)| {
+            let _ = memtable_manager.put(k, v);
+        });
+        memtable_manager
+    }
+
+    /// Recover `SSTable`s from the given log store.
+    /// Return the recovered `SstManager` and the maximum sync ID present.
+    fn recover_sst_manager<D: BlockSet + 'static>(
+        tx_log_store: &Arc<TxLogStore<D>>,
+        column_family: Option<ColumnFamily>,
+    ) -> Result<(SstManager<K, V>, SyncId)> {
+        let mut manager = SstManager::new();
+        let mut max_sync_id: SyncId = 0;
+        let mut tx = tx_log_store.new_tx();
+        let res: Result<_> = tx.context(|| {
+            for (level, bucket) in LsmLevel::iter(column_family) {
+                let log_ids = tx_log_store.list_logs_in(bucket);
+                if let Err(e) = &log_ids
+                    && e.errno() == NotFound
+                {
+                    continue;
+                }
+
+                for id in log_ids? {
+                    let log = tx_log_store.open_log(id, false)?;
+                    let sst = SSTable::<K, V>::from_log(&log)?;
+                    max_sync_id = max_sync_id.max(sst.sync_id());
+                    manager.insert(SSTable::from_log(&log)?, level);
+                }
+            }
+            Ok(())
+        });
+        if res.is_ok() {
+            tx.commit()?;
+        } else {
+            tx.abort();
+            return_errno_with_msg!(TxAborted, "recover TxLsmTree failed");
+        }
+        Ok((manager, max_sync_id))
+    }
 }
 
 impl TryFrom<u8> for ColumnFamily {
@@ -224,7 +394,9 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         // Write the record to WAL
         inner.wal_append_tx.append(&record, column_family)?;
 
-        let memtable_manager = inner.get_memtable_manager(column_family);
+        let memtable_manager = inner
+            .column_family_manager
+            .get_memtable_manager(column_family);
 
         // Put the record into `MemTable`
         let at_capacity = memtable_manager.put(key, value);
@@ -238,7 +410,10 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
 
         // Wait asynchronous compaction to finish
         // TODO: Error handling for compaction: try twice or become read-only
-        inner.get_compactor(column_family).wait_compaction()?;
+        inner
+            .column_family_manager
+            .get_compactor(column_family)
+            .wait_compaction()?;
 
         memtable_manager.switch().unwrap();
 
@@ -263,6 +438,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
             inner.shared_state.start_compaction();
             // Do major compaction first if necessary
             if inner
+                .column_family_manager
                 .get_sst_manager(column_family)
                 .read()
                 .require_major_compaction(LsmLevel::L0)
@@ -278,7 +454,10 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         });
 
         // handle.join().unwrap()?; // synchronous
-        self.0.get_compactor(column_family).record_handle(handle); // asynchronous
+        self.0
+            .column_family_manager
+            .get_compactor(column_family)
+            .record_handle(handle); // asynchronous
         Ok(())
     }
 }
@@ -292,22 +471,9 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         shared_state: SharedStateRef,
     ) -> Result<Self> {
         let sync_id: SyncId = 0;
-        let default_memtable_manager =
-            MemTableManager::new(sync_id, MEMTABLE_CAPACITY, on_drop_record_in_memtable);
-        let reverse_index_memtable_manager = MemTableManager::new(sync_id, MEMTABLE_CAPACITY, None);
-        let memtable_managers = vec![default_memtable_manager, reverse_index_memtable_manager];
-
-        let sst_managers = vec![
-            RwLock::new(SstManager::new()),
-            RwLock::new(SstManager::new()),
-        ];
-        let compactors = vec![Compactor::new(), Compactor::new()];
-
         Ok(Self {
-            memtable_manager: memtable_managers,
-            sst_manager: sst_managers,
+            column_family_manager: ColumnFamilyManager::new(sync_id, on_drop_record_in_memtable),
             wal_append_tx: WalAppendTx::new(&tx_log_store, sync_id),
-            compactor: compactors,
             tx_log_store,
             listener_factory,
             master_sync_id: MasterSyncId::new(sync_id_store, sync_id)?,
@@ -322,36 +488,11 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
         shared_state: SharedStateRef,
     ) -> Result<Self> {
-        let (synced_records, wal_sync_id) = Self::recover_from_wal(&tx_log_store)?;
-        let (sst_manager, ssts_sync_id) = Self::recover_sst_manager(&tx_log_store, None)?;
-
-        let (reverse_index_sst_manager, _) =
-            Self::recover_sst_manager(&tx_log_store, Some(ColumnFamily::ReverseIndex))?;
-        let sst_managers = vec![
-            RwLock::new(sst_manager),
-            RwLock::new(reverse_index_sst_manager),
-        ];
-
-        let compactors = vec![Compactor::new(), Compactor::new()];
-
-        let max_sync_id = wal_sync_id.max(ssts_sync_id);
-        let master_sync_id = MasterSyncId::new(sync_id_store, max_sync_id)?;
-        let sync_id = master_sync_id.id();
-
-        let memtable_manager = Self::recover_memtable_manager(
-            sync_id,
-            synced_records[0].clone().into_iter(),
-            on_drop_record_in_memtable,
-        );
-        let reverse_index_memtable_manager =
-            Self::recover_memtable_manager(sync_id, synced_records[1].clone().into_iter(), None);
-        let memtable_managers = vec![memtable_manager, reverse_index_memtable_manager];
-
+        let (column_family_manager, master_sync_id) =
+            ColumnFamilyManager::recover(&tx_log_store, sync_id_store, on_drop_record_in_memtable)?;
         let recov_self = Self {
-            memtable_manager: memtable_managers,
-            sst_manager: sst_managers,
-            wal_append_tx: WalAppendTx::new(&tx_log_store, sync_id),
-            compactor: compactors,
+            column_family_manager,
+            wal_append_tx: WalAppendTx::new(&tx_log_store, master_sync_id.id()),
             tx_log_store,
             listener_factory,
             master_sync_id,
@@ -365,82 +506,11 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         Ok(recov_self)
     }
 
-    /// Recover the synced records and the maximum sync ID from the latest WAL.
-    fn recover_from_wal(tx_log_store: &Arc<TxLogStore<D>>) -> Result<(Vec<Vec<(K, V)>>, SyncId)> {
-        let mut tx = tx_log_store.new_tx();
-        let res: Result<_> = tx.context(|| {
-            let wal_res = tx_log_store.open_log_in(BUCKET_WAL);
-            if let Err(e) = &wal_res
-                && e.errno() == NotFound
-            {
-                return Ok((vec![], 0));
-            }
-            let wal = wal_res?;
-            // Only synced records count, all unsynced are discarded
-            WalAppendTx::collect_synced_records_and_sync_id::<K, V>(&wal)
-        });
-        if res.is_ok() {
-            tx.commit()?;
-        } else {
-            tx.abort();
-            return_errno_with_msg!(TxAborted, "recover from WAL failed");
-        }
-        res
-    }
-
-    /// Recover `MemTable` from the given synced records.
-    fn recover_memtable_manager(
-        sync_id: SyncId,
-        synced_records: impl Iterator<Item = (K, V)>,
-        on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
-    ) -> MemTableManager<K, V> {
-        let memtable_manager =
-            MemTableManager::new(sync_id, MEMTABLE_CAPACITY, on_drop_record_in_memtable);
-        synced_records.into_iter().for_each(|(k, v)| {
-            let _ = memtable_manager.put(k, v);
-        });
-        memtable_manager
-    }
-
-    /// Recover `SSTable`s from the given log store.
-    /// Return the recovered `SstManager` and the maximum sync ID present.
-    fn recover_sst_manager(
-        tx_log_store: &Arc<TxLogStore<D>>,
-        column_family: Option<ColumnFamily>,
-    ) -> Result<(SstManager<K, V>, SyncId)> {
-        let mut manager = SstManager::new();
-        let mut max_sync_id: SyncId = 0;
-        let mut tx = tx_log_store.new_tx();
-        let res: Result<_> = tx.context(|| {
-            for (level, bucket) in LsmLevel::iter(column_family) {
-                let log_ids = tx_log_store.list_logs_in(bucket);
-                if let Err(e) = &log_ids
-                    && e.errno() == NotFound
-                {
-                    continue;
-                }
-
-                for id in log_ids? {
-                    let log = tx_log_store.open_log(id, false)?;
-                    let sst = SSTable::<K, V>::from_log(&log)?;
-                    max_sync_id = max_sync_id.max(sst.sync_id());
-                    manager.insert(SSTable::from_log(&log)?, level);
-                }
-            }
-            Ok(())
-        });
-        if res.is_ok() {
-            tx.commit()?;
-        } else {
-            tx.abort();
-            return_errno_with_msg!(TxAborted, "recover TxLsmTree failed");
-        }
-        Ok((manager, max_sync_id))
-    }
-
     pub fn get(&self, key: &K, column_family: Option<ColumnFamily>) -> Result<V> {
         // 1. Search from MemTables
-        let memtable_manager = self.get_memtable_manager(column_family);
+        let memtable_manager = self
+            .column_family_manager
+            .get_memtable_manager(column_family);
         if let Some(value) = memtable_manager.get(key) {
             return Ok(value);
         }
@@ -456,7 +526,9 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         range_query_ctx: &mut RangeQueryCtx<K, V>,
         column_family: Option<ColumnFamily>,
     ) -> Result<()> {
-        let memtable_manager = self.get_memtable_manager(column_family);
+        let memtable_manager = self
+            .column_family_manager
+            .get_memtable_manager(column_family);
         let is_completed = memtable_manager.get_range(range_query_ctx);
         if is_completed {
             return Ok(());
@@ -472,14 +544,14 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
         // Wait asynchronous compaction to finish
         // TODO: Error handling for compaction: try twice or become read-only
-        for compactor in self.compactor.iter() {
+        for compactor in self.column_family_manager.compactors() {
             compactor.wait_compaction()?;
         }
 
         // TODO: Error handling for WAL: try twice or become read-only
         self.wal_append_tx.sync(master_sync_id)?;
 
-        for memtable_manager in self.memtable_manager.iter() {
+        for memtable_manager in self.column_family_manager.memtable_managers() {
             memtable_manager.sync(master_sync_id);
         }
 
@@ -496,7 +568,10 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
         let read_res: Result<_> = tx.context(|| {
             // Search each level from top to bottom (newer to older)
-            let sst_manager = self.get_sst_manager(column_family).read();
+            let sst_manager = self
+                .column_family_manager
+                .get_sst_manager(column_family)
+                .read();
 
             for (level, _bucket) in LsmLevel::iter(column_family) {
                 for (_id, sst) in sst_manager.list_level(level) {
@@ -533,7 +608,10 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
         let read_res: Result<_> = tx.context(|| {
             // Search each level from top to bottom (newer to older)
-            let sst_manager = self.get_sst_manager(column_family).read();
+            let sst_manager = self
+                .column_family_manager
+                .get_sst_manager(column_family)
+                .read();
             for (level, _bucket) in LsmLevel::iter(column_family) {
                 for (_id, sst) in sst_manager.list_level(level) {
                     if !sst.overlap_with(&range_query_ctx.range_uncompleted().unwrap()) {
@@ -586,7 +664,9 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
                 .create_log(LsmLevel::L0.bucket(column_family))?;
 
             // Cook records in immutable MemTable into a new SST
-            let memtable_manager = self.get_memtable_manager(column_family);
+            let memtable_manager = self
+                .column_family_manager
+                .get_memtable_manager(column_family);
             let immutable_memtable = memtable_manager.immutable_memtable();
             let records_iter = immutable_memtable.iter();
             let sync_id = immutable_memtable.sync_id();
@@ -612,7 +692,8 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         tx.commit()?;
         event_listener.on_tx_commit();
 
-        self.get_sst_manager(column_family)
+        self.column_family_manager
+            .get_sst_manager(column_family)
             .write()
             .insert(new_sst, LsmLevel::L0);
 
@@ -648,7 +729,10 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             let (mut created_ssts, mut deleted_ssts) = (vec![], vec![]);
 
             // Collect overlapped SSTs
-            let sst_manager = self.get_sst_manager(column_family).read();
+            let sst_manager = self
+                .column_family_manager
+                .get_sst_manager(column_family)
+                .read();
             let (upper_sst_id, upper_sst) = sst_manager
                 .list_level(from_level)
                 .last() // Choose the oldest SST from upper level
@@ -671,11 +755,10 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
                     from_level.bucket(column_family),
                     to_level.bucket(column_family),
                 )?;
-                self.get_sst_manager(column_family).write().move_sst(
-                    upper_sst_id,
-                    from_level,
-                    to_level,
-                );
+                self.column_family_manager
+                    .get_sst_manager(column_family)
+                    .write()
+                    .move_sst(upper_sst_id, from_level, to_level);
                 return Ok((created_ssts, deleted_ssts));
             }
 
@@ -733,6 +816,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
         // Continue to do major compaction if necessary
         if self
+            .column_family_manager
             .get_sst_manager(column_family)
             .read()
             .require_major_compaction(to_level)
@@ -760,7 +844,10 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         let res: Result<_> = tx.context(move || {
             let (mut created_ssts, mut deleted_ssts) = (vec![], vec![]);
 
-            let sst_manager = self.get_sst_manager(column_family).read();
+            let sst_manager = self
+                .column_family_manager
+                .get_sst_manager(column_family)
+                .read();
             for (level, bucket) in LsmLevel::iter(column_family) {
                 let ssts = sst_manager.list_level(level);
                 // Iterate SSTs whose sync ID is equal to the
@@ -815,26 +902,16 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         deleted: impl Iterator<Item = (TxLogId, LsmLevel)>,
         column_family: Option<ColumnFamily>,
     ) {
-        let mut sst_manager = self.get_sst_manager(column_family).write();
+        let mut sst_manager = self
+            .column_family_manager
+            .get_sst_manager(column_family)
+            .write();
         created.for_each(|(sst, level)| {
             let _ = sst_manager.insert(sst, level);
         });
         deleted.for_each(|(id, level)| {
             let _ = sst_manager.remove(id, level);
         });
-    }
-
-    fn get_sst_manager(&self, column_family: Option<ColumnFamily>) -> &RwLock<SstManager<K, V>> {
-        let idx = column_family.map(|cf| cf as usize).unwrap_or(0);
-        &self.sst_manager[idx]
-    }
-    fn get_memtable_manager(&self, column_family: Option<ColumnFamily>) -> &MemTableManager<K, V> {
-        let idx = column_family.map(|cf| cf as usize).unwrap_or(0);
-        &self.memtable_manager[idx]
-    }
-    fn get_compactor(&self, column_family: Option<ColumnFamily>) -> &Compactor<K, V> {
-        let idx = column_family.map(|cf| cf as usize).unwrap_or(0);
-        &self.compactor[idx]
     }
 }
 
@@ -882,8 +959,14 @@ impl<K: RecordKey<K>, V, D> Drop for TreeInner<K, V, D> {
 impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> Debug for TreeInner<K, V, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TxLsmTree")
-            .field("memtable_manager", &self.memtable_manager)
-            .field("sst_manager", &self.sst_manager[0].read())
+            .field(
+                "memtable_manager",
+                &self.column_family_manager.get_memtable_manager(None),
+            )
+            .field(
+                "sst_manager",
+                &self.column_family_manager.get_sst_manager(None).read(),
+            )
             .field("tx_log_store", &self.tx_log_store)
             .finish()
     }

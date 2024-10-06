@@ -1,6 +1,6 @@
 use super::{
     block_alloc::{AllocTable, BlockAlloc},
-    reverse_index::ReverseIndexTable,
+    dealloc_block::DeallocTable,
     segment::{Segment, SegmentId},
     sworndisk::{Hba, Lba, RecordKey, RecordValue},
 };
@@ -189,7 +189,7 @@ impl VictimPolicy for LoopScanVictimPolicy {
 pub(super) struct GcWorker<D> {
     victim_policy: VictimPolicyRef,
     logical_block_table: TxLsmTree<RecordKey, RecordValue, D>,
-    reverse_index_table: Arc<ReverseIndexTable>,
+    reverse_index_table: Arc<DeallocTable>,
     block_validity_table: Arc<AllocTable>,
     tx_log_store: Arc<TxLogStore<D>>,
     tx_provider: Arc<TxProvider>,
@@ -201,7 +201,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
     pub fn new(
         victim_policy: VictimPolicyRef,
         logical_block_table: TxLsmTree<RecordKey, RecordValue, D>,
-        reverse_index_table: Arc<ReverseIndexTable>,
+        reverse_index_table: Arc<DeallocTable>,
         tx_log_store: Arc<TxLogStore<D>>,
         block_validity_table: Arc<AllocTable>,
         user_data_disk: Arc<D>,

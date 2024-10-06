@@ -10,8 +10,8 @@
 use super::bio::{BioReq, BioReqQueue, BioResp, BioType};
 use super::block_alloc::{AllocTable, BlockAlloc};
 use super::data_buf::DataBuf;
+use super::dealloc_block::DeallocTable;
 use super::gc::{GcWorker, SharedStateRef, VictimPolicy, VictimPolicyRef};
-use super::reverse_index::ReverseIndexTable;
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
 use crate::layers::disk::gc::{GreedyVictimPolicy, SharedState};
 use crate::layers::log::TxLogStore;
@@ -49,7 +49,7 @@ struct DiskInner<D: BlockSet> {
     /// A `TxLsmTree` to store metadata of the logical blocks.
     logical_block_table: TxLsmTree<RecordKey, RecordValue, D>,
     /// A reverse index table that map HBA to LBA.
-    reverse_index_table: Arc<ReverseIndexTable>,
+    dealloc_tatble: Arc<DeallocTable>,
     /// The underlying disk where user data is stored.
     user_data_disk: Arc<D>,
     /// Manage space of the data disk.
@@ -130,7 +130,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let block_validity_table = Arc::new(AllocTable::new(
             NonZeroUsize::new(data_disk.nblocks()).unwrap(),
         ));
-        let reverse_index_table = Arc::new(ReverseIndexTable::new());
+        let reverse_index_table = Arc::new(DeallocTable::new());
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
@@ -160,7 +160,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let inner = Arc::new(DiskInner {
             bio_req_queue: BioReqQueue::new(),
             logical_block_table,
-            reverse_index_table,
+            dealloc_tatble: reverse_index_table,
             user_data_disk: Arc::new(data_disk),
             block_validity_table,
             tx_log_store,
@@ -209,7 +209,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
         let shared_state = Arc::new(SharedState::new());
 
-        let reverse_index_table = Arc::new(ReverseIndexTable::new());
+        let reverse_index_table = Arc::new(DeallocTable::new());
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
@@ -239,7 +239,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let inner = Arc::new(DiskInner {
             bio_req_queue: BioReqQueue::new(),
             logical_block_table,
-            reverse_index_table,
+            dealloc_tatble: reverse_index_table,
             user_data_disk: Arc::new(data_disk),
             block_validity_table,
             data_buf: DataBuf::new(DATA_BUF_CAP),
@@ -567,7 +567,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         let gc_worker = GcWorker::new(
             policy_ref,
             self.logical_block_table.clone(),
-            self.reverse_index_table.clone(),
+            self.dealloc_tatble.clone(),
             self.tx_log_store.clone(),
             self.block_validity_table.clone(),
             self.user_data_disk.clone(),
@@ -690,14 +690,14 @@ unsafe impl<D: BlockSet> Sync for DiskInner<D> {}
 struct TxLsmTreeListenerFactory<D> {
     store: Arc<TxLogStore<D>>,
     alloc_table: Arc<AllocTable>,
-    reverse_index_table: Arc<ReverseIndexTable>,
+    reverse_index_table: Arc<DeallocTable>,
 }
 
 impl<D> TxLsmTreeListenerFactory<D> {
     fn new(
         store: Arc<TxLogStore<D>>,
         alloc_table: Arc<AllocTable>,
-        reverse_index_table: Arc<ReverseIndexTable>,
+        reverse_index_table: Arc<DeallocTable>,
     ) -> Self {
         Self {
             store,
@@ -729,14 +729,14 @@ impl<D: BlockSet + 'static> TxEventListenerFactory<RecordKey, RecordValue>
 struct TxLsmTreeListener<D> {
     tx_type: TxType,
     block_alloc: Arc<BlockAlloc<D>>,
-    reverse_index_table: Arc<ReverseIndexTable>,
+    reverse_index_table: Arc<DeallocTable>,
 }
 
 impl<D> TxLsmTreeListener<D> {
     fn new(
         tx_type: TxType,
         block_alloc: Arc<BlockAlloc<D>>,
-        reverse_index_table: Arc<ReverseIndexTable>,
+        reverse_index_table: Arc<DeallocTable>,
     ) -> Self {
         Self {
             tx_type,

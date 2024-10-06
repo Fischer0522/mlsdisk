@@ -10,11 +10,11 @@ use crate::{
     os::{BTreeMap, HashMap, Mutex},
     BlockSet,
 };
-pub(super) struct ReverseIndexTable {
+pub(super) struct DeallocTable {
     dealloc_table: Mutex<HashMap<Lba, Hba>>,
 }
 
-impl ReverseIndexTable {
+impl DeallocTable {
     pub fn new() -> Self {
         Self {
             dealloc_table: Mutex::new(HashMap::new()),
@@ -35,7 +35,7 @@ impl ReverseIndexTable {
         dealloc_table.insert(lba, hba);
     }
 
-    // TODO use btree_map::range to get hbas from index table in batch
+    // TODO: move this function to GcWorker
     // After data migration in GC task, we need:
     // 1. update the hba of the records in lsm tree
     // 2. update the reverse index table, record the old hba of the migrated blocks and insert the new hba -> lba mapping
