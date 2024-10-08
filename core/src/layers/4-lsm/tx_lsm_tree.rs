@@ -19,7 +19,7 @@ use crate::tx::Tx;
 use core::default;
 use core::hash::Hash;
 use core::ops::{Add, RangeInclusive, Sub};
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use pod::Pod;
 
 /// Monotonic incrementing sync ID.
@@ -55,7 +55,7 @@ pub struct ColumnFamilyData<K: RecordKey<K>, V> {
     memtable_manager: MemTableManager<K, V>,
     sst_manager: RwLock<SstManager<K, V>>,
     compactor: Compactor<K, V>,
-    log_id: AtomicUsize,
+    log_id: AtomicI64,
 }
 
 pub struct ColumnFamilyManager<K: RecordKey<K>, V> {
@@ -77,13 +77,13 @@ impl<K: RecordKey<K>, V: RecordValue> ColumnFamilyManager<K, V> {
                 memtable_manager: default_memtable_manager,
                 sst_manager: RwLock::new(SstManager::new()),
                 compactor: Compactor::new(),
-                log_id: AtomicUsize::new(0),
+                log_id: AtomicI64::new(-1),
             },
             ColumnFamilyData {
                 memtable_manager: reverse_index_memtable_manager,
                 sst_manager: RwLock::new(SstManager::new()),
                 compactor: Compactor::new(),
-                log_id: AtomicUsize::new(0),
+                log_id: AtomicI64::new(-1),
             },
         ];
         Self { inner }
@@ -117,13 +117,13 @@ impl<K: RecordKey<K>, V: RecordValue> ColumnFamilyManager<K, V> {
                 memtable_manager,
                 sst_manager: RwLock::new(sst_manager),
                 compactor: Compactor::new(),
-                log_id: AtomicUsize::new(0),
+                log_id: AtomicI64::new(-1),
             },
             ColumnFamilyData {
                 memtable_manager: reverse_index_memtable_manager,
                 sst_manager: RwLock::new(reverse_index_sst_manager),
                 compactor: Compactor::new(),
-                log_id: AtomicUsize::new(0),
+                log_id: AtomicI64::new(-1),
             },
         ];
         Ok((Self { inner }, master_sync_id))
@@ -137,7 +137,7 @@ impl<K: RecordKey<K>, V: RecordValue> ColumnFamilyManager<K, V> {
             .iter()
             .map(|cf| cf.log_id.load(Ordering::Acquire))
             .min()
-            .unwrap_or(usize::MAX);
+            .unwrap_or(i64::MAX);
         current_version == min_version
     }
 
@@ -145,7 +145,7 @@ impl<K: RecordKey<K>, V: RecordValue> ColumnFamilyManager<K, V> {
         let idx = column_family.map(|cf| cf as usize).unwrap_or(0);
         self.inner[idx]
             .log_id
-            .store(wal_id as usize, Ordering::Release);
+            .store(wal_id as i64, Ordering::Release);
     }
 
     fn get_sst_manager(&self, column_family: Option<ColumnFamily>) -> &RwLock<SstManager<K, V>> {
