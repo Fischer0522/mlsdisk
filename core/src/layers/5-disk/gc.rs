@@ -21,7 +21,7 @@ use crate::{
     Buf, BLOCK_SIZE,
 };
 use crate::{
-    os::{Arc, BTreeMap, Condvar, CvarMutex, Mutex, Vec},
+    os::{sleep, Arc, BTreeMap, Condvar, CvarMutex, Mutex, Vec},
     prelude,
 };
 use core::{
@@ -228,8 +228,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             self.background_gc()?;
             // Notify foreground GC and foreground I/O Requests
             self.shared_state.notify_gc_finished();
-            // FIXME: use a cross-platform sleep function
-            std::thread::sleep(DEFAULT_GC_INTERVAL_TIME);
+            sleep(DEFAULT_GC_INTERVAL_TIME);
         }
     }
 
@@ -252,7 +251,9 @@ impl<D: BlockSet + 'static> GcWorker<D> {
     // TODO: use tx to migrate data from victim to other segment and update metadata
     pub fn background_gc(&self) -> Result<()> {
         // FIXME: use a cross-platform time function
+        #[cfg(feature = "std")]
         let start = std::time::Instant::now();
+
         let mut segment_ids = Vec::with_capacity(GC_WATERMARK);
 
         for _ in 0..GC_WATERMARK {
@@ -283,14 +284,17 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             tx.commit()?;
         }
 
-        let duration = start.elapsed();
-        #[cfg(not(feature = "linux"))]
-        debug!(
-            "Background GC succeed, freed {} segments, segment_ids: {:?},took {:?}",
-            segment_ids.len(),
-            segment_ids,
-            duration
-        );
+        #[cfg(feature = "std")]
+        {
+            let duration = start.elapsed();
+            debug!(
+                "Background GC succeed, freed {} segments, segment_ids: {:?},took {:?}",
+                segment_ids.len(),
+                segment_ids,
+                duration
+            );
+        }
+
         Ok(())
     }
 

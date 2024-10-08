@@ -14,28 +14,28 @@ pub use self::jinux::{
 mod linux;
 #[cfg(feature = "linux")]
 pub use self::linux::{
-    spawn, Aead, AeadIv, AeadKey, AeadMac, Arc, BTreeMap, Box, Condvar, CurrentThread, CvarMutex,
-    HashMap, HashSet, JoinHandle, Mutex, MutexGuard, Pages, Rng, RwLock, RwLockReadGuard,
-    RwLockWriteGuard, Skcipher, SkcipherIv, SkcipherKey, String, Tid, ToString, Vec, Weak,
-    PAGE_SIZE,
+    sleep, spawn, Aead, AeadIv, AeadKey, AeadMac, Arc, BTreeMap, Box, Condvar, CurrentThread,
+    CvarMutex, HashMap, HashSet, JoinHandle, Mutex, MutexGuard, Pages, Rng, RwLock,
+    RwLockReadGuard, RwLockWriteGuard, Skcipher, SkcipherIv, SkcipherKey, String, Tid, ToString,
+    Vec, Weak, PAGE_SIZE,
 };
 
 #[cfg(feature = "occlum")]
 mod occlum;
 #[cfg(feature = "occlum")]
 pub use self::occlum::{
-    spawn, Aead, AeadIv, AeadKey, AeadMac, Arc, BTreeMap, Box, Condvar, CurrentThread, CvarMutex,
-    HashMap, HashSet, JoinHandle, Mutex, MutexGuard, Pages, Rng, RwLock, RwLockReadGuard,
-    RwLockWriteGuard, Skcipher, SkcipherIv, SkcipherKey, String, Tid, ToString, Vec, Weak,
-    PAGE_SIZE,
+    sleep, spawn, Aead, AeadIv, AeadKey, AeadMac, Arc, BTreeMap, Box, Condvar, CurrentThread,
+    CvarMutex, HashMap, HashSet, JoinHandle, Mutex, MutexGuard, Pages, Rng, RwLock,
+    RwLockReadGuard, RwLockWriteGuard, Skcipher, SkcipherIv, SkcipherKey, String, Tid, ToString,
+    Vec, Weak, PAGE_SIZE,
 };
 
 #[cfg(feature = "std")]
 mod std;
 #[cfg(feature = "std")]
 pub use self::std::{
-    spawn, Aead, AeadIv, AeadKey, AeadMac, Arc, BTreeMap, Box, Condvar, CurrentThread, CvarMutex,
-    HashMap, HashSet, JoinHandle, Mutex, MutexGuard, Pages, Rng, RwLock, RwLockReadGuard,
-    RwLockWriteGuard, Skcipher, SkcipherIv, SkcipherKey, String, Tid, ToString, Vec, Weak,
-    PAGE_SIZE,
+    sleep, spawn, Aead, AeadIv, AeadKey, AeadMac, Arc, BTreeMap, Box, Condvar, CurrentThread,
+    CvarMutex, HashMap, HashSet, JoinHandle, Mutex, MutexGuard, Pages, Rng, RwLock,
+    RwLockReadGuard, RwLockWriteGuard, Skcipher, SkcipherIv, SkcipherKey, String, Tid, ToString,
+    Vec, Weak, PAGE_SIZE,
 };

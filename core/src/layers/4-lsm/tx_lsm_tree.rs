@@ -55,7 +55,7 @@ pub struct ColumnFamilyData<K: RecordKey<K>, V> {
     memtable_manager: MemTableManager<K, V>,
     sst_manager: RwLock<SstManager<K, V>>,
     compactor: Compactor<K, V>,
-    version: AtomicUsize,
+    log_id: AtomicUsize,
 }
 
 pub struct ColumnFamilyManager<K: RecordKey<K>, V> {
@@ -77,13 +77,13 @@ impl<K: RecordKey<K>, V: RecordValue> ColumnFamilyManager<K, V> {
                 memtable_manager: default_memtable_manager,
                 sst_manager: RwLock::new(SstManager::new()),
                 compactor: Compactor::new(),
-                version: AtomicUsize::new(0),
+                log_id: AtomicUsize::new(0),
             },
             ColumnFamilyData {
                 memtable_manager: reverse_index_memtable_manager,
                 sst_manager: RwLock::new(SstManager::new()),
                 compactor: Compactor::new(),
-                version: AtomicUsize::new(0),
+                log_id: AtomicUsize::new(0),
             },
         ];
         Self { inner }
@@ -117,16 +117,35 @@ impl<K: RecordKey<K>, V: RecordValue> ColumnFamilyManager<K, V> {
                 memtable_manager,
                 sst_manager: RwLock::new(sst_manager),
                 compactor: Compactor::new(),
-                version: AtomicUsize::new(0),
+                log_id: AtomicUsize::new(0),
             },
             ColumnFamilyData {
                 memtable_manager: reverse_index_memtable_manager,
                 sst_manager: RwLock::new(reverse_index_sst_manager),
                 compactor: Compactor::new(),
-                version: AtomicUsize::new(0),
+                log_id: AtomicUsize::new(0),
             },
         ];
         Ok((Self { inner }, master_sync_id))
+    }
+
+    pub fn can_delete_wal(&self, column_family: Option<ColumnFamily>) -> bool {
+        let idx = column_family.map(|cf| cf as usize).unwrap_or(0);
+        let current_version = self.inner[idx].log_id.load(Ordering::Acquire);
+        let min_version = self
+            .inner
+            .iter()
+            .map(|cf| cf.log_id.load(Ordering::Acquire))
+            .min()
+            .unwrap_or(usize::MAX);
+        current_version == min_version
+    }
+
+    pub fn incr_version(&self, column_family: Option<ColumnFamily>, wal_id: TxLogId) {
+        let idx = column_family.map(|cf| cf as usize).unwrap_or(0);
+        self.inner[idx]
+            .log_id
+            .store(wal_id as usize, Ordering::Release);
     }
 
     fn get_sst_manager(&self, column_family: Option<ColumnFamily>) -> &RwLock<SstManager<K, V>> {
@@ -672,8 +691,20 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             let sync_id = immutable_memtable.sync_id();
 
             let sst = SSTable::build(records_iter, sync_id, &tx_log, Some(&event_listener))?;
-            // FIXME: Delete wal when all column families's memtable is flushed
-            self.tx_log_store.delete_log(wal_id)?;
+            self.column_family_manager
+                .incr_version(column_family, wal_id);
+
+            let log_ids = self.tx_log_store.list_logs_in(BUCKET_WAL)?;
+            // Delete all wals whose version is smaller than the current version
+            for log_id in log_ids {
+                if self.column_family_manager.can_delete_wal(column_family) {
+                    self.tx_log_store.delete_log(log_id)?;
+                }
+            }
+
+            if self.column_family_manager.can_delete_wal(column_family) {
+                self.tx_log_store.delete_log(wal_id)?;
+            }
             Ok(sst)
         });
         let new_sst = res.map_err(|_| {
@@ -1228,7 +1259,7 @@ mod tests {
 
     #[test]
     fn tx_lsm_tree_fns() -> Result<()> {
-        let nblocks = 102400;
+        let nblocks = 204800;
         let mem_disk = MemDisk::create(nblocks)?;
         let tx_log_store = Arc::new(TxLogStore::format(mem_disk, Key::random())?);
         let tx_lsm_tree: TxLsmTree<BlockId, Value, MemDisk> = TxLsmTree::format(

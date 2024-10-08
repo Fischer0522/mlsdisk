@@ -30,7 +30,7 @@ pub use alloc::collections::BTreeMap;
 pub use spin::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Reuse `spawn` and `JoinHandle` in `std::thread`.
-pub use std::thread::{spawn, JoinHandle};
+pub use std::thread::{sleep, spawn, JoinHandle};
 
 pub use std::sync::{Condvar, Mutex as CvarMutex};
 

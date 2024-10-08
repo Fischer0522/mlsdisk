@@ -43,7 +43,7 @@ use crate::{
 pub use btree::BTreeMap;
 
 /// Reuse `spawn` and `JoinHandle` in `bindings::thread`.
-pub use bindings::thread::{spawn, JoinHandle};
+pub use bindings::thread::{sleep, spawn, JoinHandle};
 
 /// Wrap `alloc::boxed::Box` provided by kernel.
 #[repr(transparent)]
