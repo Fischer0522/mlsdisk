@@ -495,18 +495,11 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         for (key, value) in records.iter() {
             // TODO: Error handling: Should dealloc the written blocks
             self.logical_block_table.put(key.clone(), value.clone())?;
-            let reverse_index_key = RecordKey { lba: value.hba };
-            let reverse_index_value = RecordValue {
-                hba: key.lba,
-                key: value.key,
-                mac: value.mac,
-            };
-            self.logical_block_table
+            let reverse_index_key = ReverseKey { hba: value.hba };
+            let reverse_index_value = ReverseValue { lba: key.lba };
+            self.reverse_index_table
                 .put(reverse_index_key, reverse_index_value)?;
         }
-
-        // Update reverse index table
-
         self.data_buf.clear();
         Ok(())
     }
@@ -591,6 +584,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         let gc_worker = GcWorker::new(
             policy_ref,
             self.logical_block_table.clone(),
+            self.reverse_index_table.clone(),
             self.dealloc_table.clone(),
             self.tx_log_store.clone(),
             self.block_validity_table.clone(),

@@ -41,13 +41,13 @@ const DEFAULT_GC_THRESHOLD: f64 = 0.1;
 #[repr(C)]
 #[derive(Clone, Copy, Pod, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ReverseKey {
-    hba: Hba,
+    pub hba: Hba,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Debug)]
 pub struct ReverseValue {
-    lba: Lba,
+    pub lba: Lba,
 }
 
 impl Add<usize> for ReverseKey {
@@ -224,7 +224,8 @@ impl VictimPolicy for LoopScanVictimPolicy {
 pub(super) struct GcWorker<D> {
     victim_policy: VictimPolicyRef,
     logical_block_table: TxLsmTree<RecordKey, RecordValue, D>,
-    reverse_index_table: Arc<DeallocTable>,
+    reverse_index_table: TxLsmTree<ReverseKey, ReverseValue, D>,
+    dealloc_table: Arc<DeallocTable>,
     block_validity_table: Arc<AllocTable>,
     tx_log_store: Arc<TxLogStore<D>>,
     tx_provider: Arc<TxProvider>,
@@ -236,7 +237,8 @@ impl<D: BlockSet + 'static> GcWorker<D> {
     pub fn new(
         victim_policy: VictimPolicyRef,
         logical_block_table: TxLsmTree<RecordKey, RecordValue, D>,
-        reverse_index_table: Arc<DeallocTable>,
+        reverse_index_table: TxLsmTree<ReverseKey, ReverseValue, D>,
+        dealloc_table: Arc<DeallocTable>,
         tx_log_store: Arc<TxLogStore<D>>,
         block_validity_table: Arc<AllocTable>,
         user_data_disk: Arc<D>,
@@ -247,6 +249,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             victim_policy,
             logical_block_table,
             reverse_index_table,
+            dealloc_table,
             block_validity_table,
             tx_log_store,
             user_data_disk,
@@ -278,8 +281,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         }
         // Safety: if victim is none, the function will return early
         let remapped_hbas = self.clean_and_migrate_data(victim.unwrap())?;
-        self.reverse_index_table
-            .remap_index_batch(remapped_hbas, &self.logical_block_table)?;
+        self.remap_index_batch(remapped_hbas)?;
         Ok(())
     }
 
@@ -308,8 +310,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             let ret: Result<_> = tx.context(|| {
                 let remapped_hbas = self.clean_and_migrate_data(victim)?;
 
-                self.reverse_index_table
-                    .remap_index_batch(remapped_hbas, &self.logical_block_table)?;
+                self.remap_index_batch(remapped_hbas)?;
                 Ok(())
             });
             if ret.is_err() {
@@ -333,6 +334,51 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         Ok(())
     }
 
+    // TODO: move this function to GcWorker
+    // After data migration in GC task, we need:
+    // 1. update the hba of the records in lsm tree
+    // 2. update the reverse index table, record the old hba of the migrated blocks and insert the new hba -> lba mapping
+    // 3. insert the lba -> old hba mapping into the dealloc table to prevent double deallocation in compaction
+    pub fn remap_index_batch(&self, remapped_hbas: Vec<(Hba, Hba)>) -> Result<()> {
+        remapped_hbas
+            .into_iter()
+            .try_for_each(|(old_hba, new_hba)| {
+                // Get the lba of the old hba
+                // Safety: hba should exist in index table, otherwise it means system is inconsistent
+                let key = ReverseKey { hba: old_hba };
+                let lba = self
+                    .reverse_index_table
+                    .get(&key)
+                    .map(|value| value.lba)
+                    .expect("hba should exist in index table");
+                let record_key = RecordKey { lba };
+
+                // get mac and key of the old hba record
+                // Safety: hba should exist in lsm tree, otherwise it means system is inconsistent
+                let mut record_value = self
+                    .logical_block_table
+                    .get(&record_key)
+                    .expect("record key should exist in lsm tree");
+
+                // Update the hba of the record but keep the key and mac unchanged
+                // This will trigger deallocation of the old hba in MemTable
+                record_value.hba = new_hba;
+
+                // write the record back to lsm tree
+                self.logical_block_table.put(record_key, record_value)?;
+
+                let reverse_index_key = ReverseKey { hba: new_hba };
+
+                // update the reverse index table
+                let reverse_index_value = ReverseValue { lba };
+                self.reverse_index_table
+                    .put(reverse_index_key, reverse_index_value)?;
+                self.dealloc_table.mark_deallocated(lba, old_hba);
+                Ok::<_, Error>(())
+            })?;
+        Ok::<_, Error>(())
+    }
+
     // Find valid blocks to migrate and invalid blocks to discard and free blocks to store
     pub fn find_target_hbas(
         &self,
@@ -347,8 +393,8 @@ impl<D: BlockSet + 'static> GcWorker<D> {
                 // it means the block is already invalid but not deallocated by compaction,
                 // it should be discarded and be marked to avoid double free
                 //let lba = self.reverse_index_table.get_lba(&hba);
-                let reverse_index_key = RecordKey { lba: hba };
-                let lba = self.logical_block_table.get(&reverse_index_key)?.hba;
+                let reverse_index_key = ReverseKey { hba };
+                let lba = self.reverse_index_table.get(&reverse_index_key)?.lba;
                 let old_hba = self.logical_block_table.get(&RecordKey { lba })?.hba;
                 if hba == old_hba {
                     valid.push(hba);
