@@ -7,7 +7,7 @@ use super::{
 use crate::{
     layers::{
         disk::segment::SEGMENT_SIZE,
-        lsm::{ColumnFamily, TxLsmTree},
+        lsm::{ColumnFamily, RecordKey as RecordK, RecordValue as RecordV, TxLsmTree},
     },
     tx::TxProvider,
     BlockSet, Error,
@@ -25,16 +25,51 @@ use crate::{
     prelude,
 };
 use core::{
+    ops::{Add, Sub},
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     time::Duration,
     usize,
 };
 use hashbrown::{HashMap, HashSet};
 use log::debug;
+use pod::Pod;
 // Default gc interval time is 30 seconds
 const DEFAULT_GC_INTERVAL_TIME: std::time::Duration = std::time::Duration::from_secs(3);
 const GC_WATERMARK: usize = 16;
-const DEFAULT_GC_THRESHOLD: f64 = 0.2;
+const DEFAULT_GC_THRESHOLD: f64 = 0.1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct ReserveKey {
+    hba: Hba,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Debug)]
+pub struct ReserveValue {
+    lba: Lba,
+}
+
+impl Add<usize> for ReserveKey {
+    type Output = Self;
+
+    fn add(self, rhs: usize) -> Self::Output {
+        Self {
+            hba: self.hba + rhs,
+        }
+    }
+}
+
+impl Sub<ReserveKey> for ReserveKey {
+    type Output = usize;
+
+    fn sub(self, rhs: ReserveKey) -> Self::Output {
+        self.hba - rhs.hba
+    }
+}
+
+impl RecordK<ReserveKey> for ReserveKey {}
+impl RecordV for ReserveValue {}
 
 // SharedState is used to synchronize background GC and foreground I/O requests and lsm compaction
 // 1. Background GC will stop the world, I/O requests and lsm compaction will be blocked

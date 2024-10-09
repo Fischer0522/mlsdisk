@@ -83,6 +83,7 @@ impl DeallocTable {
                     reverse_index_value,
                     Some(ColumnFamily::ReverseIndex),
                 )?;
+                self.dealloc_table.lock().insert(lba, old_hba);
                 Ok::<_, Error>(())
             })?;
         Ok::<_, Error>(())
