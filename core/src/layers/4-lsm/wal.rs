@@ -54,11 +54,7 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
     }
 
     /// Append phase for an Append TX, mainly to append newly records to the WAL.
-    pub fn append<K: Pod, V: Pod>(
-        &self,
-        record: &dyn AsKV<K, V>,
-        column_family: Option<ColumnFamily>,
-    ) -> Result<()> {
+    pub fn append<K: Pod, V: Pod>(&self, record: &dyn AsKV<K, V>) -> Result<()> {
         let mut inner = self.inner.lock();
         if inner.wal_tx_and_log.is_none() {
             inner.prepare()?;
@@ -67,7 +63,6 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
         {
             let record_buf = &mut inner.record_buf;
             record_buf.push(WalAppendFlag::Record as u8);
-            record_buf.push(column_family.unwrap_or(ColumnFamily::Default) as u8);
             record_buf.extend_from_slice(record.key().as_bytes());
             record_buf.extend_from_slice(record.value().as_bytes());
         }
@@ -155,10 +150,9 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
     /// Collects the synced records only and the maximum sync ID in the WAL.
     pub fn collect_synced_records_and_sync_id<K: Pod, V: Pod>(
         wal: &TxLog<D>,
-    ) -> Result<(Vec<Vec<(K, V)>>, SyncId)> {
+    ) -> Result<(Vec<(K, V)>, SyncId)> {
         let nblocks = wal.nblocks();
-        // TODO: Remove fixed size
-        let mut column_families: Vec<Vec<(K, V)>> = vec![Vec::new(), Vec::new()];
+        let mut records = Vec::new();
 
         // TODO: Allocate separate buffers for large WAL
         let mut buf = Buf::alloc(nblocks)?;
@@ -184,13 +178,6 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
 
             match flag.unwrap() {
                 WalAppendFlag::Record => {
-                    let flag = ColumnFamily::try_from(buf_slice[offset]);
-                    offset += 1;
-                    if flag.is_err() {
-                        continue;
-                    }
-                    let column_family_idx = flag.unwrap() as usize;
-
                     let record = {
                         let k = K::from_bytes(&buf_slice[offset..offset + k_size]);
                         let v =
@@ -198,7 +185,8 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
                         offset += k_size + v_size;
                         (k, v)
                     };
-                    column_families[column_family_idx].push(record);
+
+                    records.push(record);
                 }
                 WalAppendFlag::Sync => {
                     let sync_id = SyncId::from_le_bytes(
@@ -209,14 +197,14 @@ impl<D: BlockSet + 'static> WalAppendTx<D> {
                     offset += size_of::<SyncId>();
 
                     let _ = max_sync_id.insert(sync_id);
-                    synced_len = column_families[0].len();
+                    synced_len = records.len();
                 }
             }
         }
 
         if let Some(max_sync_id) = max_sync_id {
-            column_families[0].truncate(synced_len);
-            Ok((column_families, max_sync_id))
+            records.truncate(synced_len);
+            Ok((records, max_sync_id))
         } else {
             Ok((vec![], 0))
         }

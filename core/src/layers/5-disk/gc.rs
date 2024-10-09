@@ -40,17 +40,17 @@ const DEFAULT_GC_THRESHOLD: f64 = 0.1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct ReserveKey {
+pub struct ReverseKey {
     hba: Hba,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Debug)]
-pub struct ReserveValue {
+pub struct ReverseValue {
     lba: Lba,
 }
 
-impl Add<usize> for ReserveKey {
+impl Add<usize> for ReverseKey {
     type Output = Self;
 
     fn add(self, rhs: usize) -> Self::Output {
@@ -60,16 +60,16 @@ impl Add<usize> for ReserveKey {
     }
 }
 
-impl Sub<ReserveKey> for ReserveKey {
+impl Sub<ReverseKey> for ReverseKey {
     type Output = usize;
 
-    fn sub(self, rhs: ReserveKey) -> Self::Output {
+    fn sub(self, rhs: ReverseKey) -> Self::Output {
         self.hba - rhs.hba
     }
 }
 
-impl RecordK<ReserveKey> for ReserveKey {}
-impl RecordV for ReserveValue {}
+impl RecordK<ReverseKey> for ReverseKey {}
+impl RecordV for ReverseValue {}
 
 // SharedState is used to synchronize background GC and foreground I/O requests and lsm compaction
 // 1. Background GC will stop the world, I/O requests and lsm compaction will be blocked
@@ -348,11 +348,8 @@ impl<D: BlockSet + 'static> GcWorker<D> {
                 // it should be discarded and be marked to avoid double free
                 //let lba = self.reverse_index_table.get_lba(&hba);
                 let reverse_index_key = RecordKey { lba: hba };
-                let lba = self
-                    .logical_block_table
-                    .get(&reverse_index_key, Some(ColumnFamily::ReverseIndex))?
-                    .hba;
-                let old_hba = self.logical_block_table.get(&RecordKey { lba }, None)?.hba;
+                let lba = self.logical_block_table.get(&reverse_index_key)?.hba;
+                let old_hba = self.logical_block_table.get(&RecordKey { lba })?.hba;
                 if hba == old_hba {
                     valid.push(hba);
                 } else {

@@ -39,6 +39,8 @@ mod gc;
 mod segment;
 mod sworndisk;
 
-pub use self::gc::{GreedyVictimPolicy, LoopScanVictimPolicy, VictimPolicy};
-pub use self::gc::{SharedState, SharedStateRef};
+pub use self::gc::{
+    GreedyVictimPolicy, LoopScanVictimPolicy, ReverseKey, ReverseValue, SharedState,
+    SharedStateRef, VictimPolicy,
+};
 pub use self::sworndisk::SwornDisk;

@@ -52,7 +52,7 @@ impl DeallocTable {
                 // Safety: hba should exist in index table, otherwise it means system is inconsistent
                 let key = RecordKey { lba: old_hba };
                 let lba = tx_lsm_tree
-                    .get(&key, Some(ColumnFamily::ReverseIndex))
+                    .get(&key)
                     .map(|lba| lba.hba)
                     .expect("hba should exist in index table");
                 let record_key = RecordKey { lba };
@@ -60,7 +60,7 @@ impl DeallocTable {
                 // get mac and key of the old hba record
                 // Safety: hba should exist in lsm tree, otherwise it means system is inconsistent
                 let mut record_value = tx_lsm_tree
-                    .get(&record_key, None)
+                    .get(&record_key)
                     .expect("record key should exist in lsm tree");
 
                 // Update the hba of the record but keep the key and mac unchanged
@@ -68,7 +68,7 @@ impl DeallocTable {
                 record_value.hba = new_hba;
 
                 // write the record back to lsm tree
-                tx_lsm_tree.put(record_key, record_value, None)?;
+                tx_lsm_tree.put(record_key, record_value)?;
 
                 let reverse_index_key = RecordKey { lba: new_hba };
 
@@ -78,11 +78,7 @@ impl DeallocTable {
                     key: Key::new_uninit(),
                     mac: Mac::new_uninit(),
                 };
-                tx_lsm_tree.put(
-                    reverse_index_key,
-                    reverse_index_value,
-                    Some(ColumnFamily::ReverseIndex),
-                )?;
+                tx_lsm_tree.put(reverse_index_key, reverse_index_value)?;
                 self.dealloc_table.lock().insert(lba, old_hba);
                 Ok::<_, Error>(())
             })?;
