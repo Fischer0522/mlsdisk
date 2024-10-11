@@ -71,5 +71,5 @@ mod wal;
 pub use self::range_query_ctx::RangeQueryCtx;
 pub use self::tx_lsm_tree::{
     AsKV, ColumnFamily, LsmLevel, RecordKey, RecordValue, SyncId, SyncIdStore, TxEventListener,
-    TxEventListenerFactory, TxLsmTree, TxType,
+    TxEventListenerFactory, TxLsmTree, TxType, MEMTABLE_CAPACITY,
 };

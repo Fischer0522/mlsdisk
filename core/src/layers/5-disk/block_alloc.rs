@@ -100,6 +100,7 @@ impl AllocTable {
         let mut num_free = self.num_free.lock().unwrap();
         while *num_free < cnt {
             // TODO: May not be woken, may require manual triggering of a compaction in L4
+            debug!("num_free < cnt, require compaction");
             num_free = self.cvar.wait(num_free).unwrap();
         }
         debug_assert!(*num_free >= cnt);
@@ -368,6 +369,7 @@ impl AllocTable {
     // GC will deallocate out-of-date blocks before compaction
     // discard these blocks and increase num_free
     pub fn clear_segment(&self, segment_id: SegmentId, dealloc_count: usize) {
+        *self.num_free.lock().unwrap() += dealloc_count;
         let mut bitmap = self.bitmap.lock();
         let begin_hba = segment_id * SEGMENT_SIZE;
         let end_hba = begin_hba + SEGMENT_SIZE;
@@ -375,7 +377,6 @@ impl AllocTable {
             bitmap.set(hba, true);
         }
         self.segment_table[segment_id].clear_segment();
-        *self.num_free.lock().unwrap() += dealloc_count;
     }
 
     pub fn get_segment_table_ref(&self) -> &[Segment] {

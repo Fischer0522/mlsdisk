@@ -26,17 +26,19 @@ use crate::{
 };
 use core::{
     ops::{Add, Sub},
-    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     time::Duration,
     usize,
 };
 use hashbrown::{HashMap, HashSet};
 use log::debug;
 use pod::Pod;
+use std::time::Instant;
 // Default gc interval time is 30 seconds
 const DEFAULT_GC_INTERVAL_TIME: std::time::Duration = std::time::Duration::from_secs(3);
 const GC_WATERMARK: usize = 16;
-const DEFAULT_GC_THRESHOLD: f64 = 0.1;
+const ACTIVE_GC_THRESHOLD: f64 = 0.7;
+const INACTIVE_GC_THRESHOLD: f64 = 0.2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -231,6 +233,7 @@ pub(super) struct GcWorker<D> {
     tx_provider: Arc<TxProvider>,
     user_data_disk: Arc<D>,
     shared_state: SharedStateRef,
+    last_active_time: Arc<AtomicI32>,
 }
 
 impl<D: BlockSet + 'static> GcWorker<D> {
@@ -243,6 +246,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         block_validity_table: Arc<AllocTable>,
         user_data_disk: Arc<D>,
         shared_state: SharedStateRef,
+        last_active_time: Arc<AtomicI32>,
     ) -> Self {
         let tx_provider = TxProvider::new();
         Self {
@@ -255,6 +259,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             user_data_disk,
             shared_state,
             tx_provider,
+            last_active_time,
         }
     }
 
@@ -270,20 +275,20 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         }
     }
 
-    pub fn foreground_gc(&self) -> Result<()> {
-        self.shared_state.wait_for_background_gc();
-        let victim = self.victim_policy.pick_victim(
-            self.block_validity_table.get_segment_table_ref(),
-            DEFAULT_GC_THRESHOLD,
-        );
-        if !self.trigger_gc(victim.as_ref()) {
-            return Ok(());
-        }
-        // Safety: if victim is none, the function will return early
-        let remapped_hbas = self.clean_and_migrate_data(victim.unwrap())?;
-        self.remap_index_batch(remapped_hbas)?;
-        Ok(())
-    }
+    // pub fn foreground_gc(&self) -> Result<()> {
+    //     self.shared_state.wait_for_background_gc();
+    //     let victim = self.victim_policy.pick_victim(
+    //         self.block_validity_table.get_segment_table_ref(),
+    //         DEFAULT_GC_THRESHOLD,
+    //     );
+    //     if !self.trigger_gc(victim.as_ref()) {
+    //         return Ok(());
+    //     }
+    //     // Safety: if victim is none, the function will return early
+    //     let remapped_hbas = self.clean_and_migrate_data(victim.unwrap())?;
+    //     self.remap_index_batch(remapped_hbas)?;
+    //     Ok(())
+    // }
 
     // TODO: use tx to migrate data from victim to other segment and update metadata
     pub fn background_gc(&self) -> Result<()> {
@@ -296,7 +301,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         for _ in 0..GC_WATERMARK {
             let victim = self.victim_policy.pick_victim(
                 self.block_validity_table.get_segment_table_ref(),
-                DEFAULT_GC_THRESHOLD,
+                ACTIVE_GC_THRESHOLD,
             );
 
             // Generally, the VictimPolicy will pick a victim segment that most needs GC
@@ -309,7 +314,6 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             let mut tx = self.tx_provider.new_tx();
             let ret: Result<_> = tx.context(|| {
                 let remapped_hbas = self.clean_and_migrate_data(victim)?;
-
                 self.remap_index_batch(remapped_hbas)?;
                 Ok(())
             });
@@ -430,11 +434,15 @@ impl<D: BlockSet + 'static> GcWorker<D> {
     pub fn clean_and_migrate_data(&self, victim: Victim) -> Result<Vec<(Hba, Hba)>> {
         let victim_segment = &self.block_validity_table.get_segment_table_ref()[victim.segment_id];
 
+        //        let start = Instant::now();
         let (valid_hbas, discard_hbas, free_hbas) = self.find_target_hbas(victim)?;
         let mut victim_data = Buf::alloc(victim_segment.nblocks())?;
         let offset = victim_segment.segment_id() * SEGMENT_SIZE;
         self.user_data_disk.read(offset, victim_data.as_mut())?;
+        // let duration = start.elapsed();
+        // debug!("Find target hbas took {:?}", duration);
 
+        // let start = Instant::now();
         let target_hba_batches = free_hbas.group_by(|hba1, hba2| hba2.saturating_sub(*hba1) == 1);
         let mut victim_hba_iter = valid_hbas.iter();
         for target_hba_batch in target_hba_batches {
@@ -458,6 +466,8 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             self.user_data_disk
                 .write(*target_hba_batch.first().unwrap(), write_buf.as_ref())?;
         }
+        // let duration = start.elapsed();
+        // debug!("Write data to disk took {:?}", duration);
 
         self.block_validity_table.migrate_batch(&valid_hbas);
         self.block_validity_table

@@ -354,7 +354,7 @@ pub(super) trait AsKVex<K, V> {
 }
 
 /// Capacity of each `MemTable` and `SSTable`.
-pub(super) const MEMTABLE_CAPACITY: usize = 2097152; // 96 MiB MemTable, cover 8 GiB data // TBD
+pub const MEMTABLE_CAPACITY: usize = 2097152; // 96 MiB MemTable, cover 8 GiB data // TBD
 pub(super) const SSTABLE_CAPACITY: usize = MEMTABLE_CAPACITY;
 
 impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> {
@@ -366,6 +366,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
         shared_state: SharedStateRef,
         column_family: ColumnFamily,
+        memtable_size: usize,
     ) -> Result<Self> {
         let inner = TreeInner::format(
             tx_log_store,
@@ -374,6 +375,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
             sync_id_store,
             shared_state,
             column_family,
+            memtable_size,
         )?;
         Ok(Self(Arc::new(inner)))
     }
@@ -483,12 +485,13 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
         shared_state: SharedStateRef,
         column_family: ColumnFamily,
+        memtable_size: usize,
     ) -> Result<Self> {
         let sync_id: SyncId = 0;
         Ok(Self {
             memtable_manager: MemTableManager::new(
                 sync_id,
-                MEMTABLE_CAPACITY,
+                memtable_size,
                 on_drop_record_in_memtable,
             ),
             sst_manager: RwLock::new(SstManager::new()),
@@ -774,7 +777,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         self.sst_manager.write().insert(new_sst, LsmLevel::L0);
 
         #[cfg(not(feature = "linux"))]
-        debug!("[SwornDisk TxLsmTree] Minor Compaction completed: {self:?}");
+        //debug!("[SwornDisk TxLsmTree] Minor Compaction completed: {self:?}");
         Ok(())
     }
 
@@ -1280,6 +1283,7 @@ mod tests {
             None,
             Arc::new(SharedState::new()),
             ColumnFamily::Default,
+            MEMTABLE_CAPACITY,
         )?;
 
         // Put sufficient records which can trigger compaction before a sync command

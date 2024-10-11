@@ -19,7 +19,7 @@ use crate::layers::disk::gc::{GreedyVictimPolicy, SharedState};
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
     AsKV, ColumnFamily, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV,
-    SyncIdStore, TxEventListener, TxEventListenerFactory, TxLsmTree, TxType,
+    SyncIdStore, TxEventListener, TxEventListenerFactory, TxLsmTree, TxType, MEMTABLE_CAPACITY,
 };
 use crate::os::{
     Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, BTreeMap, Condvar, CvarMutex, RwLock,
@@ -29,10 +29,11 @@ use crate::tx::Tx;
 
 use core::num::NonZeroUsize;
 use core::ops::{Add, Sub};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use pod::Pod;
 use spin::Mutex;
 use std::thread;
+use time::Time;
 
 /// Logical Block Address.
 pub type Lba = BlockId;
@@ -51,7 +52,7 @@ struct DiskInner<D: BlockSet> {
     /// A `TxLsmTree` to store metadata of the logical blocks.
     logical_block_table: TxLsmTree<RecordKey, RecordValue, D>,
     /// A reverse index table that map HBA to LBA.
-    reverse_index_table: TxLsmTree<ReverseKey, ReverseValue, D>,
+    reverse_index_table: Option<TxLsmTree<ReverseKey, ReverseValue, D>>,
     /// A reverse index table that map HBA to LBA.
     dealloc_table: Arc<DeallocTable>,
     /// The underlying disk where user data is stored.
@@ -70,6 +71,8 @@ struct DiskInner<D: BlockSet> {
     write_sync_region: RwLock<()>,
     /// Shared state for background GC.
     shared_state: SharedStateRef,
+    /// Last active time of the disk.
+    last_active_time: Arc<AtomicI32>,
 }
 
 impl<D: BlockSet + 'static> SwornDisk<D> {
@@ -134,13 +137,31 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let block_validity_table = Arc::new(AllocTable::new(
             NonZeroUsize::new(data_disk.nblocks()).unwrap(),
         ));
-        let dealloc_table = Arc::new(DeallocTable::new());
+
+        let shared_state = Arc::new(SharedState::new());
+
+        let (dealloc_table, reverse_index_table) = if enable_gc {
+            (
+                Arc::new(DeallocTable::new()),
+                Some(TxLsmTree::format(
+                    tx_log_store.clone(),
+                    Arc::new(EmptyFactory),
+                    None,
+                    sync_id_store.clone(),
+                    shared_state.clone(),
+                    ColumnFamily::ReverseIndex,
+                    2 * MEMTABLE_CAPACITY,
+                )?),
+            )
+        } else {
+            (Arc::new(DeallocTable::new()), None)
+        };
+
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
             dealloc_table.clone(),
         ));
-        let shared_state = Arc::new(SharedState::new());
 
         let logical_block_table = {
             let table = block_validity_table.clone();
@@ -157,22 +178,13 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 tx_log_store.clone(),
                 listener_factory,
                 Some(Arc::new(on_drop_record_in_memtable)),
-                sync_id_store.clone(),
+                sync_id_store,
                 shared_state.clone(),
                 ColumnFamily::Default,
+                MEMTABLE_CAPACITY,
             )?
         };
 
-        let reverse_index_table = {
-            TxLsmTree::format(
-                tx_log_store.clone(),
-                Arc::new(EmptyFactory),
-                None,
-                sync_id_store,
-                shared_state.clone(),
-                ColumnFamily::ReverseIndex,
-            )?
-        };
         let inner = Arc::new(DiskInner {
             bio_req_queue: BioReqQueue::new(),
             logical_block_table,
@@ -186,6 +198,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             is_dropped: AtomicBool::new(false),
             write_sync_region: RwLock::new(()),
             shared_state,
+            last_active_time: Arc::new(AtomicI32::new(0)),
         });
         if enable_gc {
             let gc_worker = match victim_policy_ref {
@@ -226,7 +239,22 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
         let shared_state = Arc::new(SharedState::new());
 
-        let dealloc_table = Arc::new(DeallocTable::new());
+        let (dealloc_table, reverse_index_table) = if enable_gc {
+            (
+                Arc::new(DeallocTable::new()),
+                Some(TxLsmTree::format(
+                    tx_log_store.clone(),
+                    Arc::new(EmptyFactory),
+                    None,
+                    sync_id_store.clone(),
+                    shared_state.clone(),
+                    ColumnFamily::ReverseIndex,
+                    2 * MEMTABLE_CAPACITY,
+                )?),
+            )
+        } else {
+            (Arc::new(DeallocTable::new()), None)
+        };
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
             block_validity_table.clone(),
@@ -247,23 +275,12 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 tx_log_store.clone(),
                 listener_factory,
                 Some(Arc::new(on_drop_record_in_memtable)),
-                sync_id_store.clone(),
+                sync_id_store,
                 shared_state.clone(),
                 ColumnFamily::Default,
             )?
         };
 
-        let reverse_index_table = {
-            TxLsmTree::recover(
-                tx_log_store.clone(),
-                Arc::new(EmptyFactory),
-                None,
-                sync_id_store,
-                shared_state.clone(),
-                ColumnFamily::ReverseIndex,
-            )?
-        };
-        // TODO: Recover RIT from TxLsmTree
         let inner = Arc::new(DiskInner {
             bio_req_queue: BioReqQueue::new(),
             logical_block_table,
@@ -277,6 +294,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             is_dropped: AtomicBool::new(false),
             write_sync_region: RwLock::new(()),
             shared_state,
+            last_active_time: Arc::new(AtomicI32::new(0)),
         });
 
         if enable_gc {
@@ -495,11 +513,14 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         for (key, value) in records.iter() {
             // TODO: Error handling: Should dealloc the written blocks
             self.logical_block_table.put(key.clone(), value.clone())?;
-            let reverse_index_key = ReverseKey { hba: value.hba };
-            let reverse_index_value = ReverseValue { lba: key.lba };
-            self.reverse_index_table
-                .put(reverse_index_key, reverse_index_value)?;
+            if let Some(reverse_index_table) = &self.reverse_index_table {
+                let reverse_index_key = ReverseKey { hba: value.hba };
+                let reverse_index_value = ReverseValue { lba: key.lba };
+                reverse_index_table.put(reverse_index_key, reverse_index_value)?;
+            }
         }
+        let now = time::UtcOffset::UTC.whole_seconds();
+        self.last_active_time.store(now, Ordering::Release);
         self.data_buf.clear();
         Ok(())
     }
@@ -581,15 +602,17 @@ impl<D: BlockSet + 'static> DiskInner<D> {
     }
 
     pub fn create_gc_worker(&self, policy_ref: VictimPolicyRef) -> Result<GcWorker<D>> {
+        // Safety: `reverse_index_table` is not None when enable_gc is true
         let gc_worker = GcWorker::new(
             policy_ref,
             self.logical_block_table.clone(),
-            self.reverse_index_table.clone(),
+            self.reverse_index_table.clone().unwrap(),
             self.dealloc_table.clone(),
             self.tx_log_store.clone(),
             self.block_validity_table.clone(),
             self.user_data_disk.clone(),
             self.shared_state.clone(),
+            self.last_active_time.clone(),
         );
         Ok(gc_worker)
     }
@@ -981,7 +1004,7 @@ mod tests {
         let sworndisk = SwornDisk::create(mem_disk.clone(), root_key, None, false, None)?;
         let num_rw = 1024;
 
-        // Submit a write block I/O request
+        // // Submit a write block I/O request
         let mut wbuf = Buf::alloc(num_rw)?;
         let bufs = {
             let mut bufs = Vec::with_capacity(num_rw);
@@ -1003,7 +1026,7 @@ mod tests {
             .build();
         sworndisk.submit_bio_sync(bio_req)?;
 
-        // Sync the `SwornDisk` then do some reads
+        // // Sync the `SwornDisk` then do some reads
         sworndisk.submit_bio_sync(BioReqBuilder::new(BioType::Sync).build())?;
 
         let mut rbuf = Buf::alloc(1)?;
