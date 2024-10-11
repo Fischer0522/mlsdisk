@@ -445,6 +445,17 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         self.0.sync()
     }
 
+    pub fn manual_compaction(&self) -> Result<()> {
+        #[cfg(not(feature = "linux"))]
+        debug!("Manual compaction");
+        let inner = self.0.clone();
+        inner.shared_state.wait_for_background_gc();
+        inner.shared_state.start_compaction();
+        inner.do_major_compaction(LsmLevel::L1)?;
+        inner.shared_state.notify_compaction_finished();
+        Ok(())
+    }
+
     /// Do a compaction TX.
     /// The given `wal_id` is used to identify the WAL for discarding.
     fn do_compaction_tx(&self, wal_id: TxLogId) -> Result<()> {

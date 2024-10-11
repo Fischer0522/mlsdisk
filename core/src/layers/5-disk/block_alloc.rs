@@ -105,7 +105,9 @@ impl AllocTable {
         }
         debug_assert!(*num_free >= cnt);
 
-        let hbas = self.do_alloc_batch(count).unwrap();
+        let Some(hbas) = self.do_alloc_batch(count) else {
+            return_errno_with_msg!(OutOfDisk, "allocate blocks failed");
+        };
         debug_assert_eq!(hbas.len(), cnt);
 
         // Mark hbas allocation in SegmentTable

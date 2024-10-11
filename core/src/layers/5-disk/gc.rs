@@ -35,7 +35,8 @@ use log::debug;
 use pod::Pod;
 use std::time::Instant;
 // Default gc interval time is 30 seconds
-const DEFAULT_GC_INTERVAL_TIME: std::time::Duration = std::time::Duration::from_secs(3);
+const ACTIVE_GC_INTERVAL_TIME: core::time::Duration = core::time::Duration::from_secs(5);
+const INACTIVE_GC_INTERVAL_TIME: core::time::Duration = core::time::Duration::from_secs(1);
 const GC_WATERMARK: usize = 16;
 const ACTIVE_GC_THRESHOLD: f64 = 0.7;
 const INACTIVE_GC_THRESHOLD: f64 = 0.2;
@@ -233,7 +234,7 @@ pub(super) struct GcWorker<D> {
     tx_provider: Arc<TxProvider>,
     user_data_disk: Arc<D>,
     shared_state: SharedStateRef,
-    last_active_time: Arc<AtomicI32>,
+    is_active: Arc<AtomicBool>,
 }
 
 impl<D: BlockSet + 'static> GcWorker<D> {
@@ -246,7 +247,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
         block_validity_table: Arc<AllocTable>,
         user_data_disk: Arc<D>,
         shared_state: SharedStateRef,
-        last_active_time: Arc<AtomicI32>,
+        last_active_time: Arc<AtomicBool>,
     ) -> Self {
         let tx_provider = TxProvider::new();
         Self {
@@ -259,7 +260,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             user_data_disk,
             shared_state,
             tx_provider,
-            last_active_time,
+            is_active: last_active_time,
         }
     }
 
@@ -271,7 +272,13 @@ impl<D: BlockSet + 'static> GcWorker<D> {
             self.background_gc()?;
             // Notify foreground GC and foreground I/O Requests
             self.shared_state.notify_gc_finished();
-            sleep(DEFAULT_GC_INTERVAL_TIME);
+            if self.is_active() {
+                self.is_active.store(false, Ordering::Release);
+                sleep(ACTIVE_GC_INTERVAL_TIME);
+            } else {
+                self.is_active.store(false, Ordering::Release);
+                sleep(INACTIVE_GC_INTERVAL_TIME);
+            }
         }
     }
 
@@ -290,7 +297,9 @@ impl<D: BlockSet + 'static> GcWorker<D> {
     //     Ok(())
     // }
 
-    // TODO: use tx to migrate data from victim to other segment and update metadata
+    pub fn is_active(&self) -> bool {
+        self.is_active.load(Ordering::Acquire)
+    }
     pub fn background_gc(&self) -> Result<()> {
         // FIXME: use a cross-platform time function
         #[cfg(feature = "std")]
@@ -298,11 +307,16 @@ impl<D: BlockSet + 'static> GcWorker<D> {
 
         let mut segment_ids = Vec::with_capacity(GC_WATERMARK);
 
+        let threshold = if self.is_active() {
+            ACTIVE_GC_THRESHOLD
+        } else {
+            INACTIVE_GC_THRESHOLD
+        };
+
         for _ in 0..GC_WATERMARK {
-            let victim = self.victim_policy.pick_victim(
-                self.block_validity_table.get_segment_table_ref(),
-                ACTIVE_GC_THRESHOLD,
-            );
+            let victim = self
+                .victim_policy
+                .pick_victim(self.block_validity_table.get_segment_table_ref(), threshold);
 
             // Generally, the VictimPolicy will pick a victim segment that most needs GC
             // if it returned None, it means there is no segment needs GC, we can return

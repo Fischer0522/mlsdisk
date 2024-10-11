@@ -71,8 +71,8 @@ struct DiskInner<D: BlockSet> {
     write_sync_region: RwLock<()>,
     /// Shared state for background GC.
     shared_state: SharedStateRef,
-    /// Last active time of the disk.
-    last_active_time: Arc<AtomicI32>,
+    /// Whether the disk is active.
+    is_active: Arc<AtomicBool>,
 }
 
 impl<D: BlockSet + 'static> SwornDisk<D> {
@@ -198,7 +198,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             is_dropped: AtomicBool::new(false),
             write_sync_region: RwLock::new(()),
             shared_state,
-            last_active_time: Arc::new(AtomicI32::new(0)),
+            is_active: Arc::new(AtomicBool::new(true)),
         });
         if enable_gc {
             let gc_worker = match victim_policy_ref {
@@ -294,7 +294,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             is_dropped: AtomicBool::new(false),
             write_sync_region: RwLock::new(()),
             shared_state,
-            last_active_time: Arc::new(AtomicI32::new(0)),
+            is_active: Arc::new(AtomicBool::new(true)),
         });
 
         if enable_gc {
@@ -508,7 +508,18 @@ impl<D: BlockSet + 'static> DiskInner<D> {
 
     fn flush_data_buf(&self) -> Result<()> {
         self.wait_for_background_gc();
-        let records = self.write_blocks_from_data_buf()?;
+        let mut ret = self.write_blocks_from_data_buf();
+
+        if let Err(e) = ret.as_ref() {
+            if e.errno() == OutOfDisk {
+                self.logical_block_table.manual_compaction()?;
+                // try write again
+                ret = self.write_blocks_from_data_buf();
+            }
+        }
+
+        let records = ret?;
+
         // Insert new records of data blocks to `TxLsmTree`
         for (key, value) in records.iter() {
             // TODO: Error handling: Should dealloc the written blocks
@@ -519,8 +530,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
                 reverse_index_table.put(reverse_index_key, reverse_index_value)?;
             }
         }
-        let now = time::UtcOffset::UTC.whole_seconds();
-        self.last_active_time.store(now, Ordering::Release);
+        self.is_active.store(true, Ordering::Release);
         self.data_buf.clear();
         Ok(())
     }
@@ -612,7 +622,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
             self.block_validity_table.clone(),
             self.user_data_disk.clone(),
             self.shared_state.clone(),
-            self.last_active_time.clone(),
+            self.is_active.clone(),
         );
         Ok(gc_worker)
     }

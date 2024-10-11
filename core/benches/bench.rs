@@ -20,8 +20,8 @@ fn main() {
     util::init_logger();
     let total_bytes = 100 * GiB;
     let batch_bytes = 10 * GiB;
-    let used_rate = 0.8;
-    let round_interval = 240;
+    let used_rate = 0.5;
+    let round_interval = 0;
 
     let benches = vec![BenchBuilder::new("CleaningBench")
         .disk_type(DiskType::SwornDisk)
@@ -126,6 +126,8 @@ fn run_benches(benches: Vec<Box<dyn Bench>>) {
 type Result<T> = core::result::Result<T, Error>;
 
 mod benches {
+    use log::info;
+
     use super::disks::{BenchDisk, EncDisk};
     use super::*;
     use std::fmt::{self};
@@ -336,7 +338,7 @@ mod benches {
                     ),
                     AeadKey::default(),
                     None,
-                    true,
+                    false,
                     None,
                 )?),
 
@@ -484,7 +486,7 @@ mod benches {
                 disk.write_rnd(0 as BlockId, total_nblocks, buf_nblocks)?;
                 let elapsed = start.elapsed();
                 let throughput = DisplayThroughput::new(self.batch_bytes, elapsed);
-                println!("round[{}]: throughput: {}", i, throughput);
+                info!("round[{}]: throughput: {}", i, throughput);
                 std::thread::sleep(self.interval_sec);
             }
             Ok(())
