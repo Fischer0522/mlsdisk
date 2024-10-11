@@ -370,8 +370,8 @@ impl AllocTable {
 
     // GC will deallocate out-of-date blocks before compaction
     // discard these blocks and increase num_free
-    pub fn clear_segment(&self, segment_id: SegmentId, dealloc_count: usize) {
-        *self.num_free.lock().unwrap() += dealloc_count;
+    pub fn clear_segment(&self, segment_id: SegmentId, discard_count: usize) {
+        *self.num_free.lock().unwrap() += discard_count;
         let mut bitmap = self.bitmap.lock();
         let begin_hba = segment_id * SEGMENT_SIZE;
         let end_hba = begin_hba + SEGMENT_SIZE;

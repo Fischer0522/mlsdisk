@@ -172,7 +172,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                     dealloc_table.finish_deallocated(record.key().lba);
                     return;
                 }
-                table.set_deallocated(record.key().lba);
+                table.set_deallocated(record.value().hba);
             };
             TxLsmTree::format(
                 tx_log_store.clone(),
@@ -266,7 +266,8 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             let rit = dealloc_table.clone();
             let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
                 //  Deallocate the host block while the corresponding record is dropped in `MemTable`
-                if rit.has_deallocated(record.value().hba) {
+                if rit.has_deallocated(record.key().lba) {
+                    rit.finish_deallocated(record.key().lba);
                     return;
                 }
                 table.set_deallocated(record.value().hba);

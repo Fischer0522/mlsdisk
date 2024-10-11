@@ -458,8 +458,6 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         {
             inner.do_major_compaction(LsmLevel::L1)?;
         }
-        let wal_id = inner.wal_append_tx.commit()?;
-        inner.do_minor_compaction(wal_id)?;
         inner.shared_state.notify_compaction_finished();
         Ok(())
     }
