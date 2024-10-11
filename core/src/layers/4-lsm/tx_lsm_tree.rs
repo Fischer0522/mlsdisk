@@ -447,11 +447,19 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
 
     pub fn manual_compaction(&self) -> Result<()> {
         #[cfg(not(feature = "linux"))]
-        debug!("Manual compaction");
+        debug!("Manual compaction started");
         let inner = self.0.clone();
         inner.shared_state.wait_for_background_gc();
         inner.shared_state.start_compaction();
-        inner.do_major_compaction(LsmLevel::L1)?;
+        if inner
+            .sst_manager
+            .read()
+            .require_major_compaction(LsmLevel::L0)
+        {
+            inner.do_major_compaction(LsmLevel::L1)?;
+        }
+        let wal_id = inner.wal_append_tx.commit()?;
+        inner.do_minor_compaction(wal_id)?;
         inner.shared_state.notify_compaction_finished();
         Ok(())
     }
@@ -1044,7 +1052,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> Debug for TxLsmTree
 }
 
 impl LsmLevel {
-    const LEVEL0_RATIO: u16 = 4;
+    const LEVEL0_RATIO: u16 = 1;
     const LEVELI_RATIO: u16 = 10;
 
     const MAX_NUM_LEVELS: usize = 6;

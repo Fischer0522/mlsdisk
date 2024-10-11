@@ -150,7 +150,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                     sync_id_store.clone(),
                     shared_state.clone(),
                     ColumnFamily::ReverseIndex,
-                    2 * MEMTABLE_CAPACITY,
+                    MEMTABLE_CAPACITY,
                 )?),
             )
         } else {
