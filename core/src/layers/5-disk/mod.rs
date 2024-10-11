@@ -34,6 +34,7 @@
 mod bio;
 mod block_alloc;
 mod data_buf;
+pub mod gc;
 mod sworndisk;
 
 pub use self::sworndisk::SwornDisk;

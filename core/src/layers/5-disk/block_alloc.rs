@@ -85,6 +85,7 @@ impl AllocTable {
         let mut num_free = self.num_free.lock().unwrap();
         while *num_free < cnt {
             // TODO: May not be woken, may require manual triggering of a compaction in L4
+            warn!("wait for compaction to free up blocks");
             num_free = self.cvar.wait(num_free).unwrap();
         }
         debug_assert!(*num_free >= cnt);

@@ -11,6 +11,7 @@ use super::range_query_ctx::RangeQueryCtx;
 use super::sstable::SSTable;
 use super::wal::{WalAppendTx, BUCKET_WAL};
 use crate::layers::bio::BlockSet;
+use crate::layers::disk::gc::{SharedState, SharedStateRef};
 use crate::layers::log::{TxLogId, TxLogStore};
 use crate::os::{spawn, BTreeMap, RwLock};
 use crate::prelude::*;
@@ -24,6 +25,25 @@ use pod::Pod;
 /// Monotonic incrementing sync ID.
 pub type SyncId = u64;
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum ColumnFamily {
+    #[default]
+    Default = 0,
+    ReverseIndex,
+}
+
+impl TryFrom<u8> for ColumnFamily {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(ColumnFamily::Default),
+            1 => Ok(ColumnFamily::ReverseIndex),
+            _ => Err(Error::new(InvalidArgs)),
+        }
+    }
+}
+
 /// A transactional LSM-Tree, managing `MemTable`s, WALs and SSTs backed by `TxLogStore` (L3).
 ///
 /// Supports inserting and querying key-value records within transactions.
@@ -34,11 +54,13 @@ pub struct TxLsmTree<K: RecordKey<K>, V, D>(Arc<TreeInner<K, V, D>>);
 pub(super) struct TreeInner<K: RecordKey<K>, V, D> {
     memtable_manager: MemTableManager<K, V>,
     sst_manager: RwLock<SstManager<K, V>>,
-    wal_append_tx: WalAppendTx<D>,
     compactor: Compactor<K, V>,
+    wal_append_tx: WalAppendTx<D>,
     tx_log_store: Arc<TxLogStore<D>>,
     listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
     master_sync_id: MasterSyncId,
+    shared_state: SharedStateRef,
+    column_family: ColumnFamily,
 }
 
 /// Levels in a `TxLsmTree`.
@@ -136,7 +158,7 @@ pub(super) trait AsKVex<K, V> {
 }
 
 /// Capacity of each `MemTable` and `SSTable`.
-pub(super) const MEMTABLE_CAPACITY: usize = 2097152; // 96 MiB MemTable, cover 8 GiB data // TBD
+pub const MEMTABLE_CAPACITY: usize = 2097152; // 96 MiB MemTable, cover 8 GiB data // TBD
 pub(super) const SSTABLE_CAPACITY: usize = MEMTABLE_CAPACITY;
 
 impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> {
@@ -146,12 +168,18 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        shared_state: SharedStateRef,
+        column_family: ColumnFamily,
+        memtable_size: usize,
     ) -> Result<Self> {
         let inner = TreeInner::format(
             tx_log_store,
             listener_factory,
             on_drop_record_in_memtable,
             sync_id_store,
+            shared_state,
+            column_family,
+            memtable_size,
         )?;
         Ok(Self(Arc::new(inner)))
     }
@@ -247,20 +275,25 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        shared_state: SharedStateRef,
+        column_family: ColumnFamily,
+        memtable_size: usize,
     ) -> Result<Self> {
         let sync_id: SyncId = 0;
         Ok(Self {
             memtable_manager: MemTableManager::new(
                 sync_id,
-                MEMTABLE_CAPACITY,
+                memtable_size,
                 on_drop_record_in_memtable,
             ),
             sst_manager: RwLock::new(SstManager::new()),
-            wal_append_tx: WalAppendTx::new(&tx_log_store, sync_id),
             compactor: Compactor::new(),
+            wal_append_tx: WalAppendTx::new(&tx_log_store, sync_id),
             tx_log_store,
             listener_factory,
             master_sync_id: MasterSyncId::new(sync_id_store, sync_id)?,
+            shared_state,
+            column_family,
         })
     }
 
@@ -270,8 +303,9 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
     ) -> Result<Self> {
+        let column_family = ColumnFamily::Default;
         let (synced_records, wal_sync_id) = Self::recover_from_wal(&tx_log_store)?;
-        let (sst_manager, ssts_sync_id) = Self::recover_sst_manager(&tx_log_store)?;
+        let (sst_manager, ssts_sync_id) = Self::recover_sst_manager(&tx_log_store, column_family)?;
 
         let max_sync_id = wal_sync_id.max(ssts_sync_id);
         let master_sync_id = MasterSyncId::new(sync_id_store, max_sync_id)?;
@@ -282,6 +316,8 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             synced_records.into_iter(),
             on_drop_record_in_memtable,
         );
+        let shared_state = Arc::new(SharedState::new());
+        let column_family = ColumnFamily::Default;
 
         let recov_self = Self {
             memtable_manager,
@@ -291,6 +327,8 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             tx_log_store,
             listener_factory,
             master_sync_id,
+            shared_state,
+            column_family,
         };
 
         recov_self.do_migration_tx()?;
@@ -341,12 +379,13 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
     /// Return the recovered `SstManager` and the maximum sync ID present.
     fn recover_sst_manager(
         tx_log_store: &Arc<TxLogStore<D>>,
+        column_family: ColumnFamily,
     ) -> Result<(SstManager<K, V>, SyncId)> {
         let mut manager = SstManager::new();
         let mut max_sync_id: SyncId = 0;
         let mut tx = tx_log_store.new_tx();
         let res: Result<_> = tx.context(|| {
-            for (level, bucket) in LsmLevel::iter() {
+            for (level, bucket) in LsmLevel::iter(column_family) {
                 let log_ids = tx_log_store.list_logs_in(bucket);
                 if let Err(e) = &log_ids
                     && e.errno() == NotFound
@@ -422,7 +461,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             // Search each level from top to bottom (newer to older)
             let sst_manager = self.sst_manager.read();
 
-            for (level, _bucket) in LsmLevel::iter() {
+            for (level, _bucket) in LsmLevel::iter(self.column_family) {
                 for (_id, sst) in sst_manager.list_level(level) {
                     if !sst.is_within_range(key) {
                         continue;
@@ -454,7 +493,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         let read_res: Result<_> = tx.context(|| {
             // Search each level from top to bottom (newer to older)
             let sst_manager = self.sst_manager.read();
-            for (level, _bucket) in LsmLevel::iter() {
+            for (level, _bucket) in LsmLevel::iter(self.column_family) {
                 for (_id, sst) in sst_manager.list_level(level) {
                     if !sst.overlap_with(&range_query_ctx.range_uncompleted().unwrap()) {
                         continue;
@@ -497,7 +536,9 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         })?;
 
         let res: Result<_> = tx.context(|| {
-            let tx_log = self.tx_log_store.create_log(LsmLevel::L0.bucket())?;
+            let tx_log = self
+                .tx_log_store
+                .create_log(LsmLevel::L0.bucket(self.column_family))?;
 
             // Cook records in immutable MemTable into a new SST
             let immutable_memtable = self.memtable_manager.immutable_memtable();
@@ -527,7 +568,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         self.sst_manager.write().insert(new_sst, LsmLevel::L0);
 
         #[cfg(not(feature = "linux"))]
-        debug!("[SwornDisk TxLsmTree] Minor Compaction completed: {self:?}");
+        debug!("[SwornDisk TxLsmTree] Minor Compaction completed");
         Ok(())
     }
 
@@ -572,7 +613,11 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
             // If there are no overlapped SSTs, just move the upper SST to the lower level
             if lower_ssts.is_empty() {
-                tx_log_store.move_log(upper_sst_id, from_level.bucket(), to_level.bucket())?;
+                tx_log_store.move_log(
+                    upper_sst_id,
+                    from_level.bucket(self.column_family),
+                    to_level.bucket(self.column_family),
+                )?;
                 self.sst_manager
                     .write()
                     .move_sst(upper_sst_id, from_level, to_level);
@@ -594,6 +639,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
                 &listener,
                 to_level,
                 master_sync_id,
+                self.column_family,
             )?;
 
             // Delete the old SSTs
@@ -627,7 +673,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         );
 
         #[cfg(not(feature = "linux"))]
-        debug!("[SwornDisk TxLsmTree] Major Compaction completed: {self:?}");
+        debug!("[SwornDisk TxLsmTree] Major Compaction completed");
 
         // Continue to do major compaction if necessary
         if self.sst_manager.read().require_major_compaction(to_level) {
@@ -655,7 +701,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             let (mut created_ssts, mut deleted_ssts) = (vec![], vec![]);
 
             let sst_manager = self.sst_manager.read();
-            for (level, bucket) in LsmLevel::iter() {
+            for (level, bucket) in LsmLevel::iter(self.column_family) {
                 let ssts = sst_manager.list_level(level);
                 // Iterate SSTs whose sync ID is equal to the
                 // master sync ID, who may have unsynced records
@@ -772,21 +818,51 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> Debug for TxLsmTree
 }
 
 impl LsmLevel {
-    const LEVEL0_RATIO: u16 = 4;
+    const LEVEL0_RATIO: u16 = 1;
     const LEVELI_RATIO: u16 = 10;
 
     const MAX_NUM_LEVELS: usize = 6;
     const LEVEL_BUCKETS: [(LsmLevel, &'static str); Self::MAX_NUM_LEVELS] = [
-        (LsmLevel::L0, LsmLevel::L0.bucket()),
-        (LsmLevel::L1, LsmLevel::L1.bucket()),
-        (LsmLevel::L2, LsmLevel::L2.bucket()),
-        (LsmLevel::L3, LsmLevel::L3.bucket()),
-        (LsmLevel::L4, LsmLevel::L4.bucket()),
-        (LsmLevel::L5, LsmLevel::L5.bucket()),
+        (LsmLevel::L0, LsmLevel::L0.bucket(ColumnFamily::Default)),
+        (LsmLevel::L1, LsmLevel::L1.bucket(ColumnFamily::Default)),
+        (LsmLevel::L2, LsmLevel::L2.bucket(ColumnFamily::Default)),
+        (LsmLevel::L3, LsmLevel::L3.bucket(ColumnFamily::Default)),
+        (LsmLevel::L4, LsmLevel::L4.bucket(ColumnFamily::Default)),
+        (LsmLevel::L5, LsmLevel::L5.bucket(ColumnFamily::Default)),
     ];
 
-    pub fn iter() -> impl Iterator<Item = (LsmLevel, &'static str)> {
-        Self::LEVEL_BUCKETS.iter().cloned()
+    const REVERSE_INDEX_LEVEL_BUCKETS: [(LsmLevel, &'static str); Self::MAX_NUM_LEVELS] = [
+        (
+            LsmLevel::L0,
+            LsmLevel::L0.bucket(ColumnFamily::ReverseIndex),
+        ),
+        (
+            LsmLevel::L1,
+            LsmLevel::L1.bucket(ColumnFamily::ReverseIndex),
+        ),
+        (
+            LsmLevel::L2,
+            LsmLevel::L2.bucket(ColumnFamily::ReverseIndex),
+        ),
+        (
+            LsmLevel::L3,
+            LsmLevel::L3.bucket(ColumnFamily::ReverseIndex),
+        ),
+        (
+            LsmLevel::L4,
+            LsmLevel::L4.bucket(ColumnFamily::ReverseIndex),
+        ),
+        (
+            LsmLevel::L5,
+            LsmLevel::L5.bucket(ColumnFamily::ReverseIndex),
+        ),
+    ];
+
+    pub fn iter(column_family: ColumnFamily) -> impl Iterator<Item = (LsmLevel, &'static str)> {
+        match column_family {
+            ColumnFamily::ReverseIndex => Self::REVERSE_INDEX_LEVEL_BUCKETS.iter().cloned(),
+            ColumnFamily::Default => Self::LEVEL_BUCKETS.iter().cloned(),
+        }
     }
 
     pub fn upper_level(&self) -> LsmLevel {
@@ -799,14 +875,24 @@ impl LsmLevel {
         LsmLevel::from(*self as u8 + 1)
     }
 
-    pub const fn bucket(&self) -> &str {
-        match self {
-            LsmLevel::L0 => "L0",
-            LsmLevel::L1 => "L1",
-            LsmLevel::L2 => "L2",
-            LsmLevel::L3 => "L3",
-            LsmLevel::L4 => "L4",
-            LsmLevel::L5 => "L5",
+    pub const fn bucket(&self, column_family: ColumnFamily) -> &str {
+        match column_family {
+            ColumnFamily::ReverseIndex => match self {
+                LsmLevel::L0 => "RL0",
+                LsmLevel::L1 => "RL1",
+                LsmLevel::L2 => "RL2",
+                LsmLevel::L3 => "RL3",
+                LsmLevel::L4 => "RL4",
+                LsmLevel::L5 => "RL5",
+            },
+            ColumnFamily::Default => match self {
+                LsmLevel::L0 => "L0",
+                LsmLevel::L1 => "L1",
+                LsmLevel::L2 => "L2",
+                LsmLevel::L3 => "L3",
+                LsmLevel::L4 => "L4",
+                LsmLevel::L5 => "L5",
+            },
         }
     }
 }
@@ -970,8 +1056,16 @@ mod tests {
         let nblocks = 102400;
         let mem_disk = MemDisk::create(nblocks)?;
         let tx_log_store = Arc::new(TxLogStore::format(mem_disk, Key::random())?);
-        let tx_lsm_tree: TxLsmTree<BlockId, Value, MemDisk> =
-            TxLsmTree::format(tx_log_store.clone(), Arc::new(Factory), None, None)?;
+        let shared_state = Arc::new(SharedState::new());
+        let tx_lsm_tree: TxLsmTree<BlockId, Value, MemDisk> = TxLsmTree::format(
+            tx_log_store.clone(),
+            Arc::new(Factory),
+            None,
+            None,
+            shared_state,
+            ColumnFamily::Default,
+            MEMTABLE_CAPACITY,
+        )?;
 
         // Put sufficient records which can trigger compaction before a sync command
         let cap = MEMTABLE_CAPACITY;

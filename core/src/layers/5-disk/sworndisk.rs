@@ -11,10 +11,11 @@ use super::bio::{BioReq, BioReqQueue, BioResp, BioType};
 use super::block_alloc::{AllocTable, BlockAlloc};
 use super::data_buf::DataBuf;
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
+use crate::layers::disk::gc::SharedState;
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
-    AsKV, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, SyncIdStore,
-    TxEventListener, TxEventListenerFactory, TxLsmTree, TxType,
+    AsKV, ColumnFamily, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV,
+    SyncIdStore, TxEventListener, TxEventListenerFactory, TxLsmTree, TxType, MEMTABLE_CAPACITY,
 };
 use crate::os::{Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, RwLock};
 use crate::prelude::*;
@@ -121,6 +122,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             tx_log_store.clone(),
             block_validity_table.clone(),
         ));
+        let shared_state = Arc::new(SharedState::new());
 
         let logical_block_table = {
             let table = block_validity_table.clone();
@@ -128,11 +130,15 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 // Deallocate the host block while the corresponding record is dropped in `MemTable`
                 table.set_deallocated(record.value().hba);
             };
+            let column_family = ColumnFamily::Default;
             TxLsmTree::format(
                 tx_log_store.clone(),
                 listener_factory,
                 Some(Arc::new(on_drop_record_in_memtable)),
                 sync_id_store,
+                shared_state,
+                column_family,
+                MEMTABLE_CAPACITY,
             )?
         };
 
