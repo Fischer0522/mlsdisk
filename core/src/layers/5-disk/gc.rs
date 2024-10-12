@@ -38,7 +38,7 @@ use std::time::Instant;
 const ACTIVE_GC_INTERVAL_TIME: core::time::Duration = core::time::Duration::from_secs(5);
 const INACTIVE_GC_INTERVAL_TIME: core::time::Duration = core::time::Duration::from_secs(1);
 const GC_WATERMARK: usize = 16;
-const ACTIVE_GC_THRESHOLD: f64 = 0.7;
+const ACTIVE_GC_THRESHOLD: f64 = 0.6;
 const INACTIVE_GC_THRESHOLD: f64 = 0.2;
 
 #[repr(C)]

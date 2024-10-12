@@ -98,6 +98,9 @@ impl AllocTable {
     pub fn alloc_batch(&self, count: NonZeroUsize) -> Result<Vec<Hba>> {
         let cnt = count.get();
         let mut num_free = self.num_free.lock().unwrap();
+        if *num_free < cnt {
+            return Err(Error::with_msg(OutOfDisk, "no free slots"));
+        }
         while *num_free < cnt {
             // TODO: May not be woken, may require manual triggering of a compaction in L4
             debug!("num_free < cnt, require compaction");

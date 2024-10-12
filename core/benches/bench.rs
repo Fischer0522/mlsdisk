@@ -394,7 +394,7 @@ mod benches {
                             disk.read_rnd(local_pos, local_nblocks, buf_nblocks)
                         }
                         (IoType::Write, IoPattern::Rnd) => {
-                            disk.write_rnd(local_pos, local_nblocks, buf_nblocks)
+                            disk.write_rnd(local_pos, local_nblocks, local_nblocks, buf_nblocks)
                         }
                     })
                 })
@@ -478,12 +478,12 @@ mod benches {
         fn run(&self) -> Result<()> {
             let buf_nblocks = self.buf_size / BLOCK_SIZE;
             //let batch_nblocks = self.batch_bytes / BLOCK_SIZE;
-            let total_nblocks = self.batch_bytes / BLOCK_SIZE;
-
+            let count = self.batch_bytes / BLOCK_SIZE;
+            let total_nblocks = count * 2;
             let disk = self.disk.clone();
             for i in 0..self.loop_times {
                 let start = Instant::now();
-                disk.write_rnd(0 as BlockId, total_nblocks, buf_nblocks)?;
+                disk.write_rnd(0 as BlockId, count, total_nblocks, buf_nblocks)?;
                 let elapsed = start.elapsed();
                 let throughput = DisplayThroughput::new(self.batch_bytes, elapsed);
                 info!("round[{}]: throughput: {}", i, throughput);
@@ -547,7 +547,13 @@ mod disks {
         fn write_seq(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()>;
 
         fn read_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()>;
-        fn write_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()>;
+        fn write_rnd(
+            &self,
+            pos: BlockId,
+            count: usize,
+            total_nblocks: usize,
+            buf_nblocks: usize,
+        ) -> Result<()>;
     }
 
     #[derive(Clone)]
@@ -676,9 +682,26 @@ mod disks {
         fn write_seq(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()> {
             let buf = Buf::alloc(buf_nblocks)?;
 
+            let current_bytes = Arc::new(AtomicUsize::new(0));
+            let interval = Duration::from_secs(1);
+
+            // Clone the Arc to share it with the spawned thread
+            let current_bytes_clone = Arc::clone(&current_bytes);
+            std::thread::spawn(move || loop {
+                std::thread::sleep(interval);
+                let bytes = current_bytes_clone.load(Ordering::Acquire);
+
+                if bytes > 0 {
+                    let throughput = DisplayThroughput::new(bytes, interval);
+                    println!("throughput: {}", throughput);
+                }
+            });
+
             for i in 0..total_nblocks / buf_nblocks {
                 self.write(pos + i * buf_nblocks, buf.as_ref())?;
+                current_bytes.fetch_add(buf_nblocks * BLOCK_SIZE, Ordering::Release);
             }
+            current_bytes.store(0, Ordering::Release);
 
             self.sync()
         }
@@ -694,24 +717,16 @@ mod disks {
             Ok(())
         }
 
-        fn write_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()> {
+        fn write_rnd(
+            &self,
+            pos: BlockId,
+            count: usize,
+            total_nblocks: usize,
+            buf_nblocks: usize,
+        ) -> Result<()> {
             let buf = Buf::alloc(buf_nblocks)?;
 
-            // let current_bytes = Arc::new(AtomicUsize::new(0));
-            // let interval = Duration::from_secs(1);
-
-            // // Clone the Arc to share it with the spawned thread
-            // let current_bytes_clone = Arc::clone(&current_bytes);
-            // std::thread::spawn(move || loop {
-            //     std::thread::sleep(interval);
-            //     let bytes = current_bytes_clone.load(Ordering::Acquire);
-            //     current_bytes_clone.store(0, Ordering::Release);
-
-            //     let throughput = DisplayThroughput::new(bytes, interval);
-            //     println!("throughput: {}", throughput);
-            // });
-
-            for _ in 0..total_nblocks / buf_nblocks {
+            for _ in 0..count / buf_nblocks {
                 let rnd_pos = gen_rnd_pos(total_nblocks, buf_nblocks);
                 self.write(pos + rnd_pos, buf.as_ref())?;
                 //   current_bytes.fetch_add(buf_nblocks * BLOCK_SIZE, Ordering::Release);
@@ -809,10 +824,16 @@ mod disks {
             Ok(())
         }
 
-        fn write_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()> {
+        fn write_rnd(
+            &self,
+            pos: BlockId,
+            count: usize,
+            total_nblocks: usize,
+            buf_nblocks: usize,
+        ) -> Result<()> {
             let buf = Buf::alloc(buf_nblocks)?;
 
-            for _ in 0..total_nblocks / buf_nblocks {
+            for _ in 0..count / buf_nblocks {
                 for _ in 0..buf_nblocks {
                     Self::dummy_encrypt().unwrap();
                 }
