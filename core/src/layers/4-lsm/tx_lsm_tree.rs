@@ -12,7 +12,7 @@ use super::sstable::SSTable;
 use super::wal::{WalAppendTx, BUCKET_WAL};
 use crate::layers::bio::BlockSet;
 use crate::layers::log::{TxLogId, TxLogStore};
-use crate::os::{spawn, BTreeMap, RwLock};
+use crate::os::{spawn, BTreeMap, Condvar, CvarMutex, RwLock};
 use crate::prelude::*;
 use crate::tx::Tx;
 
@@ -20,6 +20,74 @@ use core::hash::Hash;
 use core::ops::{Add, RangeInclusive, Sub};
 use core::sync::atomic::{AtomicU64, Ordering};
 use pod::Pod;
+
+pub type SharedStateRef = Arc<SharedState>;
+pub struct SharedState {
+    gc_in_progress: CvarMutex<bool>,
+    compaction_in_progress: CvarMutex<bool>,
+    gc_condvar: Condvar,
+    compaction_condvar: Condvar,
+}
+
+impl SharedState {
+    pub fn new() -> Self {
+        Self {
+            gc_in_progress: CvarMutex::new(false),
+            compaction_in_progress: CvarMutex::new(false),
+            gc_condvar: Condvar::new(),
+            compaction_condvar: Condvar::new(),
+        }
+    }
+
+    // Compaction worker and I/O requests will call this function to wait for background GC
+    pub fn wait_for_background_gc(&self) {
+        let mut gc_in_progress = self.gc_in_progress.lock().unwrap();
+        while *gc_in_progress {
+            #[cfg(not(feature = "linux"))]
+            debug!("Waiting for background GC to finish");
+            gc_in_progress = self.gc_condvar.wait(gc_in_progress).unwrap();
+        }
+    }
+
+    // Background GC will call this function to wait for compaction finished
+    pub fn wait_for_compaction(&self) {
+        let mut compaction_in_progress = self.compaction_in_progress.lock().unwrap();
+        while *compaction_in_progress {
+            #[cfg(not(feature = "linux"))]
+            debug!("Waiting for compaction to finish");
+            compaction_in_progress = self
+                .compaction_condvar
+                .wait(compaction_in_progress)
+                .unwrap();
+        }
+    }
+
+    pub fn start_gc(&self) {
+        let mut gc_in_progress = self.gc_in_progress.lock().unwrap();
+        *gc_in_progress = true;
+    }
+
+    pub fn start_compaction(&self) {
+        #[cfg(not(feature = "linux"))]
+        debug!("Background compaction started");
+        let mut compaction_in_progress = self.compaction_in_progress.lock().unwrap();
+        *compaction_in_progress = true;
+    }
+
+    pub fn notify_gc_finished(&self) {
+        let mut gc_in_progress = self.gc_in_progress.lock().unwrap();
+        *gc_in_progress = false;
+        self.gc_condvar.notify_all();
+    }
+
+    pub fn notify_compaction_finished(&self) {
+        #[cfg(not(feature = "linux"))]
+        debug!("Background compaction finished");
+        let mut compaction_in_progress = self.compaction_in_progress.lock().unwrap();
+        *compaction_in_progress = false;
+        self.compaction_condvar.notify_all();
+    }
+}
 
 /// Monotonic incrementing sync ID.
 pub type SyncId = u64;
@@ -37,6 +105,7 @@ pub(super) struct TreeInner<K: RecordKey<K>, V, D> {
     wal_append_tx: WalAppendTx<D>,
     compactor: Compactor<K, V>,
     tx_log_store: Arc<TxLogStore<D>>,
+    shared_state: SharedStateRef,
     listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
     master_sync_id: MasterSyncId,
 }
@@ -220,6 +289,11 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
     fn do_compaction_tx(&self, wal_id: TxLogId) -> Result<()> {
         let inner = self.0.clone();
         let handle = spawn(move || -> Result<()> {
+            // Wait for background GC to finish
+            #[cfg(not(feature = "linux"))]
+            debug!("Compaction TX: waiting for background GC to finish");
+            inner.shared_state.wait_for_background_gc();
+            inner.shared_state.start_compaction();
             // Do major compaction first if necessary
             if inner
                 .sst_manager
@@ -231,7 +305,8 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
 
             // Do minor compaction
             inner.do_minor_compaction(wal_id)?;
-
+            // Notify background GC to proceed
+            inner.shared_state.notify_compaction_finished();
             Ok(())
         });
 
@@ -249,6 +324,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
     ) -> Result<Self> {
         let sync_id: SyncId = 0;
+        let shared_state = Arc::new(SharedState::new());
         Ok(Self {
             memtable_manager: MemTableManager::new(
                 sync_id,
@@ -260,6 +336,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             compactor: Compactor::new(),
             tx_log_store,
             listener_factory,
+            shared_state,
             master_sync_id: MasterSyncId::new(sync_id_store, sync_id)?,
         })
     }
@@ -283,6 +360,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             on_drop_record_in_memtable,
         );
 
+        let shared_state = Arc::new(SharedState::new());
         let recov_self = Self {
             memtable_manager,
             sst_manager: RwLock::new(sst_manager),
@@ -290,6 +368,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             compactor: Compactor::new(),
             tx_log_store,
             listener_factory,
+            shared_state,
             master_sync_id,
         };
 
@@ -527,7 +606,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         self.sst_manager.write().insert(new_sst, LsmLevel::L0);
 
         #[cfg(not(feature = "linux"))]
-        debug!("[SwornDisk TxLsmTree] Minor Compaction completed: {self:?}");
+        debug!("[SwornDisk TxLsmTree] Minor Compaction completed");
         Ok(())
     }
 
@@ -627,7 +706,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         );
 
         #[cfg(not(feature = "linux"))]
-        debug!("[SwornDisk TxLsmTree] Major Compaction completed: {self:?}");
+        debug!("[SwornDisk TxLsmTree] Major Compaction completed");
 
         // Continue to do major compaction if necessary
         if self.sst_manager.read().require_major_compaction(to_level) {
@@ -772,7 +851,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> Debug for TxLsmTree
 }
 
 impl LsmLevel {
-    const LEVEL0_RATIO: u16 = 4;
+    const LEVEL0_RATIO: u16 = 1;
     const LEVELI_RATIO: u16 = 10;
 
     const MAX_NUM_LEVELS: usize = 6;
