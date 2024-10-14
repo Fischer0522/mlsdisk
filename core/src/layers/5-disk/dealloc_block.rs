@@ -3,7 +3,6 @@ use pod::Pod;
 
 use super::sworndisk::{Hba, Lba, RecordKey, RecordValue};
 use crate::layers::crypto::{Key, Mac};
-use crate::layers::lsm::ColumnFamily;
 use crate::prelude::{Error, Result, Vec};
 use crate::{
     layers::lsm::TxLsmTree,

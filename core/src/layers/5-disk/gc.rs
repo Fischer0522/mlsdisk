@@ -7,7 +7,7 @@ use super::{
 use crate::{
     layers::{
         disk::segment::SEGMENT_SIZE,
-        lsm::{ColumnFamily, RecordKey as RecordK, RecordValue as RecordV, TxLsmTree},
+        lsm::{RecordKey as RecordK, RecordValue as RecordV, TxLsmTree},
     },
     tx::TxProvider,
     BlockSet, Error,
@@ -36,7 +36,7 @@ use pod::Pod;
 use std::time::Instant;
 // Default gc interval time is 30 seconds
 const ACTIVE_GC_INTERVAL_TIME: core::time::Duration = core::time::Duration::from_secs(5);
-const INACTIVE_GC_INTERVAL_TIME: core::time::Duration = core::time::Duration::from_secs(1);
+const INACTIVE_GC_INTERVAL_TIME: core::time::Duration = core::time::Duration::from_millis(100);
 const GC_WATERMARK: usize = 16;
 const ACTIVE_GC_THRESHOLD: f64 = 0.6;
 const INACTIVE_GC_THRESHOLD: f64 = 0.2;

@@ -18,8 +18,8 @@ use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
 use crate::layers::disk::gc::{GreedyVictimPolicy, SharedState};
 use crate::layers::log::TxLogStore;
 use crate::layers::lsm::{
-    AsKV, ColumnFamily, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV,
-    SyncIdStore, TxEventListener, TxEventListenerFactory, TxLsmTree, TxType, MEMTABLE_CAPACITY,
+    AsKV, LsmLevel, RangeQueryCtx, RecordKey as RecordK, RecordValue as RecordV, SyncIdStore,
+    TxEventListener, TxEventListenerFactory, TxLsmTree, TxType,
 };
 use crate::os::{
     Aead, AeadIv as Iv, AeadKey as Key, AeadMac as Mac, BTreeMap, Condvar, CvarMutex, RwLock,
@@ -132,7 +132,7 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     ) -> Result<Self> {
         let data_disk = Self::subdisk_for_data(&disk)?;
         let lsm_tree_disk = Self::subdisk_for_logical_block_table(&disk)?;
-
+        let reverse_index_disk = Self::subdisk_for_reverse_index_table(&disk)?;
         let tx_log_store = Arc::new(TxLogStore::format(lsm_tree_disk, root_key.clone())?);
         let block_validity_table = Arc::new(AllocTable::new(
             NonZeroUsize::new(data_disk.nblocks()).unwrap(),
@@ -141,16 +141,16 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
         let shared_state = Arc::new(SharedState::new());
 
         let (dealloc_table, reverse_index_table) = if enable_gc {
+            let reverse_index_tx_log_store =
+                Arc::new(TxLogStore::format(reverse_index_disk, root_key.clone())?);
             (
                 Arc::new(DeallocTable::new()),
                 Some(TxLsmTree::format(
-                    tx_log_store.clone(),
+                    reverse_index_tx_log_store,
                     Arc::new(EmptyFactory),
                     None,
                     sync_id_store.clone(),
                     shared_state.clone(),
-                    ColumnFamily::ReverseIndex,
-                    MEMTABLE_CAPACITY,
                 )?),
             )
         } else {
@@ -180,8 +180,6 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 Some(Arc::new(on_drop_record_in_memtable)),
                 sync_id_store,
                 shared_state.clone(),
-                ColumnFamily::Default,
-                MEMTABLE_CAPACITY,
             )?
         };
 
@@ -248,8 +246,6 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                     None,
                     sync_id_store.clone(),
                     shared_state.clone(),
-                    ColumnFamily::ReverseIndex,
-                    2 * MEMTABLE_CAPACITY,
                 )?),
             )
         } else {
@@ -278,7 +274,6 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 Some(Arc::new(on_drop_record_in_memtable)),
                 sync_id_store,
                 shared_state.clone(),
-                ColumnFamily::Default,
             )?
         };
 
@@ -341,7 +336,11 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
     }
 
     fn subdisk_for_logical_block_table(disk: &D) -> Result<D> {
-        disk.subset(disk.nblocks() * 15 / 16..disk.nblocks()) // TBD
+        disk.subset(disk.nblocks() * 15 / 16..disk.nblocks() * 31 / 32) // TBD
+    }
+
+    fn subdisk_for_reverse_index_table(disk: &D) -> Result<D> {
+        disk.subset(disk.nblocks() * 31 / 32..disk.nblocks()) // TBD
     }
 
     // Create a gc worker but not launch, just for test

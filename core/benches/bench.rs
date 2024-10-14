@@ -20,7 +20,7 @@ fn main() {
     util::init_logger();
     let total_bytes = 100 * GiB;
     let batch_bytes = 10 * GiB;
-    let used_rate = 0.8;
+    let used_rate = 0.5;
     let round_interval = 0;
 
     let benches = vec![BenchBuilder::new("CleaningBench")
@@ -479,7 +479,7 @@ mod benches {
             let buf_nblocks = self.buf_size / BLOCK_SIZE;
             //let batch_nblocks = self.batch_bytes / BLOCK_SIZE;
             let count = self.batch_bytes / BLOCK_SIZE;
-            let total_nblocks = count * 2;
+            let total_nblocks = count;
             let disk = self.disk.clone();
             for i in 0..self.loop_times {
                 let start = Instant::now();

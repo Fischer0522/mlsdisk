@@ -1,5 +1,5 @@
 //! Transactions in WriteAhead Log.
-use super::{AsKV, ColumnFamily, SyncId};
+use super::{AsKV, SyncId};
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufRef};
 use crate::layers::log::{TxLog, TxLogId, TxLogStore};
 use crate::os::Mutex;
