@@ -105,7 +105,6 @@ pub(super) struct TreeInner<K: RecordKey<K>, V, D> {
     wal_append_tx: WalAppendTx<D>,
     compactor: Compactor<K, V>,
     tx_log_store: Arc<TxLogStore<D>>,
-    shared_state: SharedStateRef,
     listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
     master_sync_id: MasterSyncId,
 }
@@ -216,11 +215,13 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
     ) -> Result<Self> {
+        let shared_state = Arc::new(SharedState::new());
         let inner = TreeInner::format(
             tx_log_store,
             listener_factory,
             on_drop_record_in_memtable,
             sync_id_store,
+            shared_state,
         )?;
         Ok(Self(Arc::new(inner)))
     }
@@ -232,11 +233,13 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
     ) -> Result<Self> {
+        let shared_state = Arc::new(SharedState::new());
         let inner = TreeInner::recover(
             tx_log_store,
             listener_factory,
             on_drop_record_in_memtable,
             sync_id_store,
+            shared_state,
         )?;
         Ok(Self(Arc::new(inner)))
     }
@@ -289,11 +292,6 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
     fn do_compaction_tx(&self, wal_id: TxLogId) -> Result<()> {
         let inner = self.0.clone();
         let handle = spawn(move || -> Result<()> {
-            // Wait for background GC to finish
-            #[cfg(not(feature = "linux"))]
-            debug!("Compaction TX: waiting for background GC to finish");
-            inner.shared_state.wait_for_background_gc();
-            inner.shared_state.start_compaction();
             // Do major compaction first if necessary
             if inner
                 .sst_manager
@@ -305,8 +303,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> 
 
             // Do minor compaction
             inner.do_minor_compaction(wal_id)?;
-            // Notify background GC to proceed
-            inner.shared_state.notify_compaction_finished();
+
             Ok(())
         });
 
@@ -322,9 +319,9 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        shared_state: SharedStateRef,
     ) -> Result<Self> {
         let sync_id: SyncId = 0;
-        let shared_state = Arc::new(SharedState::new());
         Ok(Self {
             memtable_manager: MemTableManager::new(
                 sync_id,
@@ -336,7 +333,6 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             compactor: Compactor::new(),
             tx_log_store,
             listener_factory,
-            shared_state,
             master_sync_id: MasterSyncId::new(sync_id_store, sync_id)?,
         })
     }
@@ -346,6 +342,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
         listener_factory: Arc<dyn TxEventListenerFactory<K, V>>,
         on_drop_record_in_memtable: Option<Arc<dyn Fn(&dyn AsKV<K, V>)>>,
         sync_id_store: Option<Arc<dyn SyncIdStore>>,
+        shared_state: SharedStateRef,
     ) -> Result<Self> {
         let (synced_records, wal_sync_id) = Self::recover_from_wal(&tx_log_store)?;
         let (sst_manager, ssts_sync_id) = Self::recover_sst_manager(&tx_log_store)?;
@@ -360,7 +357,6 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             on_drop_record_in_memtable,
         );
 
-        let shared_state = Arc::new(SharedState::new());
         let recov_self = Self {
             memtable_manager,
             sst_manager: RwLock::new(sst_manager),
@@ -368,7 +364,6 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
             compactor: Compactor::new(),
             tx_log_store,
             listener_factory,
-            shared_state,
             master_sync_id,
         };
 
@@ -1049,6 +1044,7 @@ mod tests {
         let nblocks = 102400;
         let mem_disk = MemDisk::create(nblocks)?;
         let tx_log_store = Arc::new(TxLogStore::format(mem_disk, Key::random())?);
+
         let tx_lsm_tree: TxLsmTree<BlockId, Value, MemDisk> =
             TxLsmTree::format(tx_log_store.clone(), Arc::new(Factory), None, None)?;
 

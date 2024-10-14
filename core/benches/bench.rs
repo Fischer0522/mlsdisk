@@ -20,7 +20,7 @@ fn main() {
     util::init_logger();
     let total_bytes = 100 * GiB;
     let batch_bytes = 10 * GiB;
-    let used_rate = 0.8;
+    let used_rate = 0.5;
     let round_interval = 0;
 
     let benches = vec![BenchBuilder::new("CleaningBench")
