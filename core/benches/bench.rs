@@ -21,7 +21,7 @@ fn main() {
     let total_bytes = 100 * GiB;
     let batch_bytes = 10 * GiB;
     let used_rate = 0.5;
-    let round_interval = 0;
+    let round_interval = 30;
 
     let benches = vec![BenchBuilder::new("CleaningBench")
         .disk_type(DiskType::SwornDisk)
@@ -726,11 +726,31 @@ mod disks {
         ) -> Result<()> {
             let buf = Buf::alloc(buf_nblocks)?;
 
+            let current_bytes = Arc::new(AtomicUsize::new(0));
+            let interval = Duration::from_secs(1);
+
+            // Clone the Arc to share it with the spawned thread
+            let current_bytes_clone = Arc::clone(&current_bytes);
+            std::thread::spawn(move || loop {
+                std::thread::sleep(interval);
+                let bytes = current_bytes_clone.load(Ordering::Acquire);
+
+                if bytes > 0 {
+                    let throughput = DisplayThroughput::new(bytes, interval);
+                    println!("throughput: {}", throughput);
+                }
+
+                if bytes == 11455555 {
+                    return;
+                }
+            });
+
             for _ in 0..count / buf_nblocks {
                 let rnd_pos = gen_rnd_pos(total_nblocks, buf_nblocks);
                 self.write(pos + rnd_pos, buf.as_ref())?;
-                //   current_bytes.fetch_add(buf_nblocks * BLOCK_SIZE, Ordering::Release);
+                current_bytes.fetch_add(buf_nblocks * BLOCK_SIZE, Ordering::Release);
             }
+            current_bytes.store(11455555, Ordering::Release);
 
             self.sync()
         }

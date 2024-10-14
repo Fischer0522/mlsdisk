@@ -818,7 +818,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> Clone for TxLsmTree
 }
 
 impl LsmLevel {
-    const LEVEL0_RATIO: u16 = 1;
+    const LEVEL0_RATIO: u16 = 4;
     const LEVELI_RATIO: u16 = 10;
 
     const MAX_NUM_LEVELS: usize = 6;
