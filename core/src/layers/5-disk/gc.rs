@@ -39,7 +39,7 @@ const ACTIVE_GC_INTERVAL_TIME: core::time::Duration = core::time::Duration::from
 const INACTIVE_GC_INTERVAL_TIME: core::time::Duration = core::time::Duration::from_millis(100);
 const GC_WATERMARK: usize = 16;
 const ACTIVE_GC_THRESHOLD: f64 = 0.6;
-const INACTIVE_GC_THRESHOLD: f64 = 0.2;
+const INACTIVE_GC_THRESHOLD: f64 = 0.1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -165,22 +165,19 @@ impl VictimPolicy for GreedyVictimPolicy {
     fn pick_victim(&self, segment_table: &[Segment], threshold: f64) -> Option<Victim> {
         let mut max_num_invalid_blocks = 0;
         let mut victim = None;
-        segment_table
-            .iter()
-            .enumerate()
-            .for_each(|(i, alloc_table)| {
-                let invalid_block_fraction =
-                    alloc_table.num_invalid_blocks() as f64 / alloc_table.nblocks() as f64;
-                if invalid_block_fraction > threshold
-                    && alloc_table.num_invalid_blocks() > max_num_invalid_blocks
-                {
-                    max_num_invalid_blocks = alloc_table.num_invalid_blocks();
-                    victim = Some(Victim {
-                        segment_id: i,
-                        blocks: vec![],
-                    });
-                }
-            });
+        segment_table.iter().enumerate().for_each(|(i, segment)| {
+            let invalid_block_fraction =
+                segment.num_invalid_blocks() as f64 / segment.nblocks() as f64;
+            if invalid_block_fraction > threshold
+                && segment.num_invalid_blocks() > max_num_invalid_blocks
+            {
+                max_num_invalid_blocks = segment.num_invalid_blocks();
+                victim = Some(Victim {
+                    segment_id: i,
+                    blocks: vec![],
+                });
+            }
+        });
         victim.map(|mut victim| {
             let victim_segment = &segment_table[victim.segment_id];
             victim.blocks = victim_segment.find_all_allocated_blocks();
@@ -391,7 +388,7 @@ impl<D: BlockSet + 'static> GcWorker<D> {
                 let reverse_index_value = ReverseValue { lba };
                 self.reverse_index_table
                     .put(reverse_index_key, reverse_index_value)?;
-                self.dealloc_table.mark_deallocated(lba, old_hba);
+                self.dealloc_table.mark_deallocated(old_hba);
                 Ok::<_, Error>(())
             })?;
         Ok::<_, Error>(())
@@ -715,7 +712,7 @@ mod tests {
     #[test]
     fn simple_data_migration() {
         init_logger();
-        let nblocks = 128 * SEGMENT_SIZE;
+        let nblocks = 256 * SEGMENT_SIZE;
         let mem_disk = MemDisk::create(nblocks).unwrap();
         let greedy_victim_policy = GreedyVictimPolicy {};
         let root_key = AeadKey::random();
@@ -748,7 +745,7 @@ mod tests {
     #[test]
     fn batch_data_migration() {
         init_logger();
-        let nblocks = 128 * SEGMENT_SIZE;
+        let nblocks = 256 * SEGMENT_SIZE;
         let mem_disk = MemDisk::create(nblocks).unwrap();
         let greedy_victim_policy = GreedyVictimPolicy {};
         let root_key = AeadKey::random();
@@ -797,7 +794,7 @@ mod tests {
     #[test]
     fn multi_segment_migration() {
         init_logger();
-        let nblocks = 128 * SEGMENT_SIZE;
+        let nblocks = 256 * SEGMENT_SIZE;
         let mem_disk = MemDisk::create(nblocks * 5 / 4).unwrap();
         let greedy_victim_policy = GreedyVictimPolicy {};
         let root_key = AeadKey::random();

@@ -144,7 +144,9 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             let reverse_index_tx_log_store =
                 Arc::new(TxLogStore::format(reverse_index_disk, root_key.clone())?);
             (
-                Arc::new(DeallocTable::new()),
+                Arc::new(DeallocTable::new(
+                    NonZeroUsize::new(data_disk.nblocks()).unwrap(),
+                )),
                 Some(TxLsmTree::format(
                     reverse_index_tx_log_store,
                     Arc::new(EmptyFactory),
@@ -154,7 +156,12 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 )?),
             )
         } else {
-            (Arc::new(DeallocTable::new()), None)
+            (
+                Arc::new(DeallocTable::new(
+                    NonZeroUsize::new(data_disk.nblocks()).unwrap(),
+                )),
+                None,
+            )
         };
 
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
@@ -168,8 +175,8 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             let dealloc_table = dealloc_table.clone();
             let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
                 // Deallocate the host block while the corresponding record is dropped in `MemTable`
-                if dealloc_table.has_deallocated(record.key().lba) {
-                    dealloc_table.finish_deallocated(record.key().lba);
+                if dealloc_table.has_deallocated(record.value().hba) {
+                    dealloc_table.finish_deallocated(record.value().hba);
                     return;
                 }
                 table.set_deallocated(record.value().hba);
@@ -239,7 +246,9 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
 
         let (dealloc_table, reverse_index_table) = if enable_gc {
             (
-                Arc::new(DeallocTable::new()),
+                Arc::new(DeallocTable::new(
+                    NonZeroUsize::new(data_disk.nblocks()).unwrap(),
+                )),
                 Some(TxLsmTree::format(
                     tx_log_store.clone(),
                     Arc::new(EmptyFactory),
@@ -249,7 +258,12 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
                 )?),
             )
         } else {
-            (Arc::new(DeallocTable::new()), None)
+            (
+                Arc::new(DeallocTable::new(
+                    NonZeroUsize::new(data_disk.nblocks()).unwrap(),
+                )),
+                None,
+            )
         };
         let listener_factory = Arc::new(TxLsmTreeListenerFactory::new(
             tx_log_store.clone(),
@@ -262,8 +276,8 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             let rit = dealloc_table.clone();
             let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
                 //  Deallocate the host block while the corresponding record is dropped in `MemTable`
-                if rit.has_deallocated(record.key().lba) {
-                    rit.finish_deallocated(record.key().lba);
+                if rit.has_deallocated(record.value().hba) {
+                    rit.finish_deallocated(record.value().hba);
                     return;
                 }
                 table.set_deallocated(record.value().hba);
@@ -587,7 +601,7 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         self.flush_data_buf()?;
         debug_assert!(self.data_buf.is_empty());
 
-        self.logical_block_table.sync()?;
+        // self.logical_block_table.sync()?;
 
         // XXX: May impact performance when there comes frequent syncs
         self.block_validity_table
@@ -804,7 +818,7 @@ impl<K, V> TxEventListener<K, V> for EmptyListener {
 struct TxLsmTreeListener<D> {
     tx_type: TxType,
     block_alloc: Arc<BlockAlloc<D>>,
-    reverse_index_table: Arc<DeallocTable>,
+    dealloc_table: Arc<DeallocTable>,
 }
 
 impl<D> TxLsmTreeListener<D> {
@@ -816,7 +830,7 @@ impl<D> TxLsmTreeListener<D> {
         Self {
             tx_type,
             block_alloc,
-            reverse_index_table,
+            dealloc_table: reverse_index_table,
         }
     }
 }
@@ -843,6 +857,10 @@ impl<D: BlockSet + 'static> TxEventListener<RecordKey, RecordValue> for TxLsmTre
                 unreachable!();
             }
             TxType::Compaction { .. } | TxType::Migration => {
+                if self.dealloc_table.has_deallocated(record.value().hba) {
+                    self.dealloc_table.finish_deallocated(record.value().hba);
+                    return Ok(());
+                }
                 self.block_alloc.dealloc_block(record.value().hba)
             }
         }
@@ -1007,7 +1025,7 @@ mod tests {
 
     #[test]
     fn sworndisk_fns() -> Result<()> {
-        let nblocks = 64 * 1024;
+        let nblocks = 128 * 1024;
         let mem_disk = MemDisk::create(nblocks)?;
         let root_key = Key::random();
         // Create a new `SwornDisk` then do some writes

@@ -20,8 +20,8 @@ fn main() {
     util::init_logger();
     let total_bytes = 100 * GiB;
     let batch_bytes = 10 * GiB;
-    let used_rate = 0.5;
-    let round_interval = 30;
+    let used_rate = 0.8;
+    let round_interval = 90;
 
     let benches = vec![BenchBuilder::new("CleaningBench")
         .disk_type(DiskType::SwornDisk)
@@ -33,7 +33,7 @@ fn main() {
         .batch_bytes(batch_bytes)
         .used_rate(used_rate)
         .interval_sec(Duration::from_secs(round_interval))
-        .loop_times(10)
+        .loop_times(11)
         .build()
         .unwrap()];
 
@@ -338,7 +338,7 @@ mod benches {
                     ),
                     AeadKey::default(),
                     None,
-                    false,
+                    true,
                     None,
                 )?),
 
@@ -702,8 +702,8 @@ mod disks {
                 current_bytes.fetch_add(buf_nblocks * BLOCK_SIZE, Ordering::Release);
             }
             current_bytes.store(0, Ordering::Release);
-
-            self.sync()
+            self.sync()?;
+            Ok(())
         }
 
         fn read_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()> {
@@ -751,8 +751,8 @@ mod disks {
                 current_bytes.fetch_add(buf_nblocks * BLOCK_SIZE, Ordering::Release);
             }
             current_bytes.store(11455555, Ordering::Release);
-
-            self.sync()
+            self.sync()?;
+            Ok(())
         }
     }
 
