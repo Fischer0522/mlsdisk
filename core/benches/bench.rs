@@ -14,59 +14,78 @@ use self::util::{DisplayData, DisplayThroughput};
 use libc::{fdatasync, ftruncate, open, pread, pwrite, unlink, O_CREAT, O_DIRECT, O_RDWR, O_TRUNC};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn main() {
-    let total_bytes = 512 * MiB;
+    util::init_logger();
+    let total_bytes = 100 * GiB;
+    let batch_bytes = 10 * GiB;
+    let used_rate = 0.5;
+    let round_interval = 0;
+
+    let benches = vec![BenchBuilder::new("CleaningBench")
+        .disk_type(DiskType::SwornDisk)
+        .io_type(IoType::Write)
+        .io_pattern(IoPattern::Rnd)
+        .total_bytes(total_bytes)
+        .buf_size(4 * KiB)
+        .concurrency(1)
+        .batch_bytes(batch_bytes)
+        .used_rate(used_rate)
+        .interval_sec(Duration::from_secs(round_interval))
+        .loop_times(10)
+        .build()
+        .unwrap()];
+
     // Specify all benchmarks
-    let benches = vec![
-        BenchBuilder::new("SwornDisk::write_seq")
-            .disk_type(DiskType::SwornDisk)
-            .io_type(IoType::Write)
-            .io_pattern(IoPattern::Seq)
-            .total_bytes(total_bytes)
-            .buf_size(512 * KiB)
-            .concurrency(1)
-            .build()
-            .unwrap(),
-        BenchBuilder::new("SwornDisk::write_rnd")
-            .disk_type(DiskType::SwornDisk)
-            .io_type(IoType::Write)
-            .io_pattern(IoPattern::Rnd)
-            .total_bytes(total_bytes)
-            .buf_size(4 * KiB)
-            .concurrency(1)
-            .build()
-            .unwrap(),
-        BenchBuilder::new("SwornDisk::read_seq")
-            .disk_type(DiskType::SwornDisk)
-            .io_type(IoType::Read)
-            .io_pattern(IoPattern::Seq)
-            .total_bytes(total_bytes)
-            .buf_size(1 * MiB)
-            .concurrency(1)
-            .build()
-            .unwrap(),
-        BenchBuilder::new("SwornDisk::read_rnd")
-            .disk_type(DiskType::SwornDisk)
-            .io_type(IoType::Read)
-            .io_pattern(IoPattern::Rnd)
-            .total_bytes(total_bytes)
-            .buf_size(4 * KiB)
-            .concurrency(1)
-            .build()
-            .unwrap(),
-        // Benchmark on `EncDisk` not enabled by default
-        // BenchBuilder::new("EncDisk::write_seq")
-        //     .disk_type(DiskType::EncDisk)
-        //     .io_type(IoType::Write)
-        //     .io_pattern(IoPattern::Seq)
-        //     .total_bytes(total_bytes)
-        //     .buf_size(256 * KiB)
-        //     .concurrency(1)
-        //     .build()
-        //     .unwrap(),
-    ];
+    //  let benches = vec![
+    // BenchBuilder::new("SwornDisk::write_seq")
+    //     .disk_type(DiskType::SwornDisk)
+    //     .io_type(IoType::Write)
+    //     .io_pattern(IoPattern::Seq)
+    //     .total_bytes(total_bytes)
+    //     .buf_size(512 * KiB)
+    //     .concurrency(1)
+    //     .build()
+    //     .unwrap(),
+    // BenchBuilder::new("SwornDisk::write_rnd")
+    //     .disk_type(DiskType::SwornDisk)
+    //     .io_type(IoType::Write)
+    //     .io_pattern(IoPattern::Rnd)
+    //     .total_bytes(total_bytes)
+    //     .buf_size(4 * KiB)
+    //     .concurrency(1)
+    //     .build()
+    //     .unwrap(),
+    // BenchBuilder::new("SwornDisk::read_seq")
+    //     .disk_type(DiskType::SwornDisk)
+    //     .io_type(IoType::Read)
+    //     .io_pattern(IoPattern::Seq)
+    //     .total_bytes(total_bytes)
+    //     .buf_size(1 * MiB)
+    //     .concurrency(1)
+    //     .build()
+    //     .unwrap(),
+    // BenchBuilder::new("SwornDisk::read_rnd")
+    //     .disk_type(DiskType::SwornDisk)
+    //     .io_type(IoType::Read)
+    //     .io_pattern(IoPattern::Rnd)
+    //     .total_bytes(total_bytes)
+    //     .buf_size(4 * KiB)
+    //     .concurrency(1)
+    //     .build()
+    //     .unwrap(),
+    // Benchmark on `EncDisk` not enabled by default
+    // BenchBuilder::new("EncDisk::write_seq")
+    //     .disk_type(DiskType::EncDisk)
+    //     .io_type(IoType::Write)
+    //     .io_pattern(IoPattern::Seq)
+    //     .total_bytes(total_bytes)
+    //     .buf_size(256 * KiB)
+    //     .concurrency(1)
+    //     .build()
+    //     .unwrap(),
+    //   ];
 
     // Run all benchmarks and output the results
     run_benches(benches);
@@ -78,8 +97,8 @@ fn run_benches(benches: Vec<Box<dyn Bench>>) {
     let mut benched_count = 0;
     let mut failed_count = 0;
     for b in benches {
-        print!("bench {} ... ", &b);
-        b.prepare();
+        print!("bench {} ... \n", &b);
+        let _ = b.prepare();
 
         let start = Instant::now();
         let res = b.run();
@@ -88,10 +107,10 @@ fn run_benches(benches: Vec<Box<dyn Bench>>) {
             println!("failed due to error {:?}", e);
             continue;
         }
-        let elapsed = start.elapsed();
+        //  let elapsed = start.elapsed();
 
-        let throughput = DisplayThroughput::new(b.total_bytes(), elapsed);
-        println!("{}", throughput);
+        // let throughput = DisplayThroughput::new(b.total_bytes(), elapsed);
+        // println!("total throughput: {}", throughput);
 
         b.display_ext();
         benched_count += 1;
@@ -107,11 +126,13 @@ fn run_benches(benches: Vec<Box<dyn Bench>>) {
 type Result<T> = core::result::Result<T, Error>;
 
 mod benches {
+    use log::info;
+
     use super::disks::{BenchDisk, EncDisk};
     use super::*;
-
     use std::fmt::{self};
     use std::thread::{self, JoinHandle};
+    use std::time::Duration;
 
     pub trait Bench: fmt::Display {
         /// Returns the name of the benchmark.
@@ -140,6 +161,10 @@ mod benches {
         buf_size: usize,
         total_bytes: usize,
         concurrency: u32,
+        batch_bytes: Option<usize>,
+        used_rate: Option<f64>,
+        interval_sec: Option<Duration>,
+        loop_times: Option<usize>,
     }
 
     impl BenchBuilder {
@@ -152,6 +177,10 @@ mod benches {
                 buf_size: 4 * KiB,
                 total_bytes: 1 * MiB,
                 concurrency: 1,
+                batch_bytes: None,
+                used_rate: None,
+                interval_sec: None,
+                loop_times: None,
             }
         }
 
@@ -185,6 +214,26 @@ mod benches {
             self
         }
 
+        pub fn batch_bytes(mut self, batch_bytes: usize) -> Self {
+            self.batch_bytes = Some(batch_bytes);
+            self
+        }
+
+        pub fn used_rate(mut self, used_rate: f64) -> Self {
+            self.used_rate = Some(used_rate);
+            self
+        }
+
+        pub fn interval_sec(mut self, interval_sec: Duration) -> Self {
+            self.interval_sec = Some(interval_sec);
+            self
+        }
+
+        pub fn loop_times(mut self, loop_times: usize) -> Self {
+            self.loop_times = Some(loop_times);
+            self
+        }
+
         pub fn build(self) -> Result<Box<dyn Bench>> {
             let Self {
                 name,
@@ -194,6 +243,10 @@ mod benches {
                 buf_size,
                 total_bytes,
                 concurrency,
+                batch_bytes,
+                used_rate,
+                interval_sec,
+                loop_times,
             } = self;
 
             let disk_type = match disk_type {
@@ -222,6 +275,41 @@ mod benches {
             }
             if concurrency == 0 {
                 return_errno_with_msg!(Errno::InvalidArgs, "concurrency must be greater than 0");
+            }
+
+            if let Some(interval_sec) = interval_sec {
+                let batch_bytes = match batch_bytes {
+                    Some(batch_bytes) => batch_bytes,
+                    None => return_errno_with_msg!(
+                        Errno::InvalidArgs,
+                        "batch_bytes must be given if interval_sec is given"
+                    ),
+                };
+                let used_rate = match used_rate {
+                    Some(used_rate) => used_rate,
+                    None => return_errno_with_msg!(
+                        Errno::InvalidArgs,
+                        "used_rate must be given if interval_sec is given"
+                    ),
+                };
+                let loop_times = match loop_times {
+                    Some(loop_times) => loop_times,
+                    None => return_errno_with_msg!(
+                        Errno::InvalidArgs,
+                        "loop_times must be given if interval_sec is given"
+                    ),
+                };
+                let disk = Self::create_disk(total_bytes / BLOCK_SIZE, disk_type)?;
+                return Ok(Box::new(CleaningBench {
+                    name,
+                    disk,
+                    buf_size,
+                    total_bytes,
+                    batch_bytes,
+                    used_rate,
+                    interval_sec,
+                    loop_times,
+                }));
             }
 
             let disk = Self::create_disk(total_bytes / BLOCK_SIZE, disk_type)?;
@@ -304,7 +392,7 @@ mod benches {
                             disk.read_rnd(local_pos, local_nblocks, buf_nblocks)
                         }
                         (IoType::Write, IoPattern::Rnd) => {
-                            disk.write_rnd(local_pos, local_nblocks, buf_nblocks)
+                            disk.write_rnd(local_pos, local_nblocks, local_nblocks, buf_nblocks)
                         }
                     })
                 })
@@ -354,6 +442,67 @@ mod benches {
         }
     }
 
+    pub struct CleaningBench {
+        name: String,
+        disk: Arc<dyn BenchDisk>,
+        buf_size: usize,
+        total_bytes: usize,
+        batch_bytes: usize,
+        used_rate: f64,
+        interval_sec: Duration,
+        loop_times: usize,
+    }
+
+    impl Bench for CleaningBench {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn total_bytes(&self) -> usize {
+            // total_bytes is used to calculate throughput, so return batch_bytes here
+            self.batch_bytes * self.loop_times
+        }
+
+        fn prepare(&self) -> Result<()> {
+            // Fill the disk with specified used rate before a read bench
+            let disk = self.disk.clone();
+            let total_nblocks =
+                (self.total_bytes as f64 * self.used_rate / BLOCK_SIZE as f64) as usize;
+            thread::spawn(move || disk.write_seq(0 as BlockId, total_nblocks, 1024))
+                .join()
+                .unwrap()
+        }
+
+        fn run(&self) -> Result<()> {
+            let buf_nblocks = self.buf_size / BLOCK_SIZE;
+            //let batch_nblocks = self.batch_bytes / BLOCK_SIZE;
+            let count = self.batch_bytes / BLOCK_SIZE;
+            let total_nblocks = count * 2;
+            let disk = self.disk.clone();
+            for i in 0..self.loop_times {
+                let start = Instant::now();
+                disk.write_rnd(0 as BlockId, count, total_nblocks, buf_nblocks)?;
+                let elapsed = start.elapsed();
+                let throughput = DisplayThroughput::new(self.batch_bytes, elapsed);
+                info!("round[{}]: throughput: {}", i, throughput);
+                std::thread::sleep(self.interval_sec);
+            }
+            Ok(())
+        }
+    }
+
+    impl fmt::Display for CleaningBench {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "{} (total = {}, buf = {})\n",
+                self.name(),
+                DisplayData::new(self.total_bytes),
+                DisplayData::new(self.buf_size),
+            )
+        }
+    }
+
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum IoType {
         Read,
@@ -383,7 +532,7 @@ mod consts {
 #[allow(dead_code, temporary_cstring_as_ptr)]
 mod disks {
     use super::*;
-    use std::{ffi::CString, ops::Range};
+    use std::{ffi::CString, ops::Range, sync::atomic::AtomicUsize, time::Duration};
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum DiskType {
@@ -396,7 +545,13 @@ mod disks {
         fn write_seq(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()>;
 
         fn read_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()>;
-        fn write_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()>;
+        fn write_rnd(
+            &self,
+            pos: BlockId,
+            count: usize,
+            total_nblocks: usize,
+            buf_nblocks: usize,
+        ) -> Result<()>;
     }
 
     #[derive(Clone)]
@@ -525,9 +680,26 @@ mod disks {
         fn write_seq(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()> {
             let buf = Buf::alloc(buf_nblocks)?;
 
+            let current_bytes = Arc::new(AtomicUsize::new(0));
+            let interval = Duration::from_secs(1);
+
+            // Clone the Arc to share it with the spawned thread
+            let current_bytes_clone = Arc::clone(&current_bytes);
+            std::thread::spawn(move || loop {
+                std::thread::sleep(interval);
+                let bytes = current_bytes_clone.load(Ordering::Acquire);
+
+                if bytes > 0 {
+                    let throughput = DisplayThroughput::new(bytes, interval);
+                    println!("throughput: {}", throughput);
+                }
+            });
+
             for i in 0..total_nblocks / buf_nblocks {
                 self.write(pos + i * buf_nblocks, buf.as_ref())?;
+                current_bytes.fetch_add(buf_nblocks * BLOCK_SIZE, Ordering::Release);
             }
+            current_bytes.store(0, Ordering::Release);
 
             self.sync()
         }
@@ -543,13 +715,40 @@ mod disks {
             Ok(())
         }
 
-        fn write_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()> {
+        fn write_rnd(
+            &self,
+            pos: BlockId,
+            count: usize,
+            total_nblocks: usize,
+            buf_nblocks: usize,
+        ) -> Result<()> {
             let buf = Buf::alloc(buf_nblocks)?;
 
-            for _ in 0..total_nblocks / buf_nblocks {
+            let current_bytes = Arc::new(AtomicUsize::new(0));
+            let interval = Duration::from_secs(1);
+
+            // Clone the Arc to share it with the spawned thread
+            let current_bytes_clone = Arc::clone(&current_bytes);
+            std::thread::spawn(move || loop {
+                std::thread::sleep(interval);
+                let bytes = current_bytes_clone.load(Ordering::Acquire);
+
+                if bytes > 0 {
+                    let throughput = DisplayThroughput::new(bytes, interval);
+                    println!("throughput: {}", throughput);
+                }
+
+                if bytes == 11455555 {
+                    return;
+                }
+            });
+
+            for _ in 0..count / buf_nblocks {
                 let rnd_pos = gen_rnd_pos(total_nblocks, buf_nblocks);
                 self.write(pos + rnd_pos, buf.as_ref())?;
+                current_bytes.fetch_add(buf_nblocks * BLOCK_SIZE, Ordering::Release);
             }
+            current_bytes.store(11455555, Ordering::Release);
 
             self.sync()
         }
@@ -643,10 +842,16 @@ mod disks {
             Ok(())
         }
 
-        fn write_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()> {
+        fn write_rnd(
+            &self,
+            pos: BlockId,
+            count: usize,
+            total_nblocks: usize,
+            buf_nblocks: usize,
+        ) -> Result<()> {
             let buf = Buf::alloc(buf_nblocks)?;
 
-            for _ in 0..total_nblocks / buf_nblocks {
+            for _ in 0..count / buf_nblocks {
                 for _ in 0..buf_nblocks {
                     Self::dummy_encrypt().unwrap();
                 }
@@ -663,6 +868,13 @@ mod util {
     use super::*;
     use std::fmt::{self};
     use std::time::Duration;
+
+    pub fn init_logger() {
+        env_logger::builder()
+            .filter_level(log::LevelFilter::Debug)
+            .try_init()
+            .unwrap();
+    }
 
     /// Display the amount of data in the unit of GiB, MiB, KiB, or bytes.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
