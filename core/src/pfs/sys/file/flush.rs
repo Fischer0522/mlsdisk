@@ -96,8 +96,6 @@ impl<D: BlockSet> FileInner<D> {
 
         if flush {
             self.host_file.flush()?;
-            self.journal.commit()?;
-            // flush the recovery file to disk
             self.journal.flush()?;
             // all nodes are persisted on disk, the recovery file is no longer needed
             self.journal.reset()?;

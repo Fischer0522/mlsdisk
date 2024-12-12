@@ -109,8 +109,6 @@ impl<D: BlockSet> RecoveryJournal<D> {
                 "recovery node size is not equal to recovery node size",
             ))
         );
-        let flag = JournalFlag::Node;
-        self.raw.append(&[flag as u8])?;
         self.raw.append(data)
     }
 
