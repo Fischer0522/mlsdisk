@@ -136,7 +136,7 @@ pub(super) trait AsKVex<K, V> {
 }
 
 /// Capacity of each `MemTable` and `SSTable`.
-pub(super) const MEMTABLE_CAPACITY: usize = 2097152; // 96 MiB MemTable, cover 8 GiB data // TBD
+pub(super) const MEMTABLE_CAPACITY: usize = 262144; // 12 MiB MemTable, cover 1 GiB data // TBD
 pub(super) const SSTABLE_CAPACITY: usize = MEMTABLE_CAPACITY;
 
 impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> {
@@ -482,6 +482,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
     /// Minor Compaction TX { to_level: LsmLevel::L0 }.
     fn do_minor_compaction(&self, wal_id: TxLogId) -> Result<()> {
+        info!("Trigger Minor Compaction");
         let mut tx = self.tx_log_store.new_tx();
         // Prepare TX listener
         let tx_type = TxType::Compaction {
@@ -533,6 +534,7 @@ impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TreeInner<K, V, D> 
 
     /// Major Compaction TX { to_level: LsmLevel::L1~LsmLevel::L5 }.
     fn do_major_compaction(&self, to_level: LsmLevel) -> Result<()> {
+        info!("Trigger Major Compaction");
         let from_level = to_level.upper_level();
         let mut tx = self.tx_log_store.new_tx();
 

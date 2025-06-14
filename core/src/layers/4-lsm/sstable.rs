@@ -112,7 +112,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
     const MIN_RECORD_SIZE: usize = BID_SIZE + Self::FLAG_SIZE + Self::V_SIZE;
     const MAX_RECORD_SIZE: usize = BID_SIZE + Self::FLAG_SIZE + 2 * Self::V_SIZE;
     const INDEX_ENTRY_SIZE: usize = BID_SIZE + 2 * Self::K_SIZE;
-    const CACHE_CAP: usize = 1024;
+    const CACHE_CAP: usize = 1;
 
     /// Return the ID of this `SSTable`, which is the same ID
     /// to the underlying `TxLog`.

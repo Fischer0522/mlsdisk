@@ -12,12 +12,27 @@ use self::disks::{DiskType, FileAsDisk};
 use self::util::{DisplayData, DisplayThroughput};
 
 use libc::{fdatasync, ftruncate, open, pread, pwrite, unlink, O_CREAT, O_DIRECT, O_RDWR, O_TRUNC};
+use std::sync::Once;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+static INIT_LOG: Once = Once::new();
+
+fn init_logger() {
+    INIT_LOG.call_once(|| {
+        env_logger::builder()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Info)
+            .try_init()
+            .unwrap();
+    });
+}
+
 fn main() {
-    let total_bytes = 512 * MiB;
+    init_logger();
+    let total_bytes = 2 * GiB;
+    let capacity = 10 * GiB;
     // Specify all benchmarks
     let benches = vec![
         BenchBuilder::new("SwornDisk::write_seq")
@@ -25,7 +40,8 @@ fn main() {
             .io_type(IoType::Write)
             .io_pattern(IoPattern::Seq)
             .total_bytes(total_bytes)
-            .buf_size(512 * KiB)
+            .capacity(capacity)
+            .buf_size(256 * KiB)
             .concurrency(1)
             .build()
             .unwrap(),
@@ -34,6 +50,7 @@ fn main() {
             .io_type(IoType::Write)
             .io_pattern(IoPattern::Rnd)
             .total_bytes(total_bytes)
+            .capacity(capacity)
             .buf_size(4 * KiB)
             .concurrency(1)
             .build()
@@ -43,7 +60,8 @@ fn main() {
             .io_type(IoType::Read)
             .io_pattern(IoPattern::Seq)
             .total_bytes(total_bytes)
-            .buf_size(1 * MiB)
+            .capacity(capacity)
+            .buf_size(256 * KiB)
             .concurrency(1)
             .build()
             .unwrap(),
@@ -52,6 +70,7 @@ fn main() {
             .io_type(IoType::Read)
             .io_pattern(IoPattern::Rnd)
             .total_bytes(total_bytes)
+            .capacity(capacity)
             .buf_size(4 * KiB)
             .concurrency(1)
             .build()
@@ -139,6 +158,7 @@ mod benches {
         io_pattern: Option<IoPattern>,
         buf_size: usize,
         total_bytes: usize,
+        capacity: usize,
         concurrency: u32,
     }
 
@@ -151,6 +171,7 @@ mod benches {
                 io_pattern: None,
                 buf_size: 4 * KiB,
                 total_bytes: 1 * MiB,
+                capacity: 1 * MiB,
                 concurrency: 1,
             }
         }
@@ -180,6 +201,11 @@ mod benches {
             self
         }
 
+        pub fn capacity(mut self, capacity: usize) -> Self {
+            self.capacity = capacity;
+            self
+        }
+
         pub fn concurrency(mut self, concurrency: u32) -> Self {
             self.concurrency = concurrency;
             self
@@ -193,6 +219,7 @@ mod benches {
                 io_pattern,
                 buf_size,
                 total_bytes,
+                capacity,
                 concurrency,
             } = self;
 
@@ -224,7 +251,7 @@ mod benches {
                 return_errno_with_msg!(Errno::InvalidArgs, "concurrency must be greater than 0");
             }
 
-            let disk = Self::create_disk(total_bytes / BLOCK_SIZE, disk_type)?;
+            let disk = Self::create_disk(capacity / BLOCK_SIZE, disk_type)?;
             Ok(Box::new(SimpleDiskBench {
                 name,
                 disk,
@@ -232,11 +259,15 @@ mod benches {
                 io_pattern,
                 buf_size,
                 total_bytes,
+                capacity,
                 concurrency,
             }))
         }
 
-        fn create_disk(total_nblocks: usize, disk_type: DiskType) -> Result<Arc<dyn BenchDisk>> {
+        fn create_disk(
+            total_nblocks: usize,
+            disk_type: DiskType,
+        ) -> Result<Arc<dyn BenchDisk>> {
             static DISK_ID: AtomicU32 = AtomicU32::new(0);
 
             let disk: Arc<dyn BenchDisk> = match disk_type {
@@ -268,6 +299,7 @@ mod benches {
         io_pattern: IoPattern,
         buf_size: usize,
         total_bytes: usize,
+        capacity: usize,
         concurrency: u32,
     }
 
@@ -332,7 +364,7 @@ mod benches {
             }
             // Fill the disk before a read bench
             let disk = self.disk.clone();
-            let total_nblocks = self.total_bytes / BLOCK_SIZE;
+            let total_nblocks = self.capacity / BLOCK_SIZE;
             thread::spawn(move || disk.write_seq(0 as BlockId, total_nblocks, 1024))
                 .join()
                 .unwrap()
@@ -382,6 +414,8 @@ mod consts {
 
 #[allow(dead_code, temporary_cstring_as_ptr)]
 mod disks {
+    use log::warn;
+
     use super::*;
     use std::{ffi::CString, ops::Range};
 
@@ -535,9 +569,23 @@ mod disks {
         fn read_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()> {
             let mut buf = Buf::alloc(buf_nblocks)?;
 
-            for _ in 0..total_nblocks / buf_nblocks {
+            let sampling_per_ops = 1000;
+
+            let mut total_bytes = 0;
+            let mut begin = Instant::now();
+
+            for i in 0..total_nblocks / buf_nblocks {
                 let rnd_pos = gen_rnd_pos(total_nblocks, buf_nblocks);
                 self.read(pos + rnd_pos, buf.as_mut())?;
+
+                if i % sampling_per_ops == 0 {
+                    total_bytes += sampling_per_ops * buf_nblocks * BLOCK_SIZE;
+                    let elapsed = begin.elapsed();
+                    let throughput = DisplayThroughput::new(total_bytes, elapsed);
+                    warn!("Random Read Throughput: {}", throughput);
+                    total_bytes = 0;
+                    begin = Instant::now();
+                }
             }
 
             Ok(())
