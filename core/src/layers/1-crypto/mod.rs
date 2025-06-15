@@ -3,6 +3,7 @@
 mod crypto_blob;
 mod crypto_chain;
 mod crypto_log;
+mod mht;
 
 pub use self::crypto_blob::CryptoBlob;
 pub use self::crypto_chain::CryptoChain;

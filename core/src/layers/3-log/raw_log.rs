@@ -385,7 +385,6 @@ impl<D: BlockSet> BlockLog for RawLog<D> {
         let log_ref = self.as_ref();
         log_ref.read(pos, buf)
     }
-
     /// Appends one or multiple blocks at the end.
     ///
     /// This method must be called within a TX. Otherwise, this method panics.
@@ -400,6 +399,11 @@ impl<D: BlockSet> BlockLog for RawLog<D> {
         let nblocks = buf.nblocks();
         let pos = self.append_pos.fetch_add(nblocks, Ordering::Release);
         Ok(pos)
+    }
+
+    fn update(&self, offset: BlockId, buf: BufRef) -> Result<()> {
+        let mut log_ref = self.as_ref();
+        log_ref.update(offset, buf)
     }
 
     /// Ensures that blocks are persisted to the disk.
@@ -539,6 +543,47 @@ impl<'a, D: BlockSet> RawLogRef<'a, D> {
         Ok(())
     }
 
+    pub fn update(&mut self, mut offset: BlockId, buf: BufRef) -> Result<()> {
+        let mut nblocks = buf.nblocks();
+        let head_len = self.head_len();
+        let tail_len = self.tail_len();
+        let total_len = head_len + tail_len;
+
+        if offset + nblocks > total_len {
+            return_errno_with_msg!(InvalidArgs, "do not allow short update");
+        }
+
+        let disk = &self.log_store.disk;
+
+        // Update from the head if possible and necessary
+        let head_opt = &mut self.log_head;
+        if let Some(head) = head_opt
+            && offset < head_len
+        {
+            let num_update = nblocks.min(head_len - offset);
+
+            head.update(offset, buf, &disk)?;
+
+            offset += num_update;
+            nblocks -= num_update;
+        }
+        if nblocks == 0 {
+            return Ok(());
+        }
+
+        // Update from the tail if possible and necessary
+        let tail_opt = &mut self.log_tail;
+        if let Some(tail) = tail_opt
+            && offset >= head_len
+        {
+            let num_update = nblocks.min(total_len - offset);
+            let update_buf = BufRef::try_from(&buf.as_slice()[(offset - head_len) * BLOCK_SIZE..(offset - head_len + num_update) * BLOCK_SIZE])?;
+
+            tail.update(offset - head_len, update_buf, &disk)?;
+        }
+        Ok(())
+    }
+
     /// Appends one or multiple blocks at the end (to the tail).
     ///
     /// # Panics
@@ -602,6 +647,27 @@ impl<'a, D: BlockSet> RawLogRef<'a, D> {
 impl<'a> RawLogHeadRef<'a> {
     pub fn len(&self) -> usize {
         self.entry.head.num_blocks as _
+    }
+
+    pub fn update<D: BlockSet>(&mut self, offset: BlockId, buf: BufRef, disk: &D) -> Result<()> {
+        let nblocks = buf.nblocks();
+        debug_assert!(offset + nblocks <= self.entry.head.num_blocks as _);
+
+        let prepared_blocks = self.prepare_blocks(offset, nblocks);
+        debug_assert_eq!(prepared_blocks.len(), nblocks);
+
+        // Batch write
+        // Note that `prepared_blocks` are not always sorted
+        let mut offset = 0;
+        for consecutive_blocks in prepared_blocks.group_by(|b1, b2| b2.saturating_sub(*b1) == 1) {
+            let len = consecutive_blocks.len();
+            let first_bid = *consecutive_blocks.first().unwrap();
+            let buf_slice = &buf.as_slice()[offset * BLOCK_SIZE..(offset + len) * BLOCK_SIZE];
+            offset += len;
+            disk.write(first_bid, BufRef::try_from(buf_slice).unwrap())?;
+        }
+
+        Ok(())
     }
 
     pub fn read<D: BlockSet>(&self, offset: BlockId, mut buf: BufMut, disk: &D) -> Result<()> {
@@ -696,6 +762,29 @@ impl<'a> RawLogTailRef<'a> {
             let buf_slice =
                 &mut buf.as_mut_slice()[offset * BLOCK_SIZE..(offset + len) * BLOCK_SIZE];
             disk.read(first_bid, BufMut::try_from(buf_slice).unwrap())?;
+            offset += len;
+        }
+
+        Ok(())
+    }
+
+    pub fn update<D: BlockSet>(&self, offset: BlockId, buf: BufRef, disk: &D) -> Result<()> {
+        let nblocks = buf.nblocks();
+        let tail_nblocks = self.len();
+        debug_assert!(offset + nblocks <= tail_nblocks);
+
+        let prepared_blocks = self.prepare_blocks(offset, nblocks);
+        debug_assert_eq!(prepared_blocks.len(), nblocks);
+
+        // Batch write
+        // Note that `prepared_blocks` are not always sorted
+        let mut offset = 0;
+        for consecutive_blocks in prepared_blocks.group_by(|b1, b2| b2.saturating_sub(*b1) == 1) {
+            let len = consecutive_blocks.len();
+            let first_bid = *consecutive_blocks.first().unwrap();
+            let buf_slice = &buf.as_slice()[offset * BLOCK_SIZE..(offset + len) * BLOCK_SIZE];
+            offset += len;
+            disk.write(first_bid, BufRef::try_from(buf_slice).unwrap())?;
             offset += len;
         }
 
@@ -1091,10 +1180,10 @@ impl TxData for RawLogStoreEdit {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layers::{
+    use crate::{layers::{
         bio::{Buf, MemDisk},
         log::chunk::{CHUNK_NBLOCKS, CHUNK_SIZE},
-    };
+    }, tx};
 
     use std::thread::{self, JoinHandle};
 
@@ -1113,6 +1202,54 @@ mod tests {
     ) -> Option<RawLogEntry> {
         let state = log_store.state.lock();
         state.persistent.find_log(log_id)
+    }
+
+    #[test]
+    fn raw_log_update() -> Result<()> {
+        let raw_log_store = create_raw_log_store()?;
+
+        // TX 1: create a new log and append contents (committed)
+        let mut tx = raw_log_store.new_tx();
+        let res: Result<RawLogId> = tx.context(|| {
+            let new_log = raw_log_store.create_log()?;
+            let mut buf = Buf::alloc(4)?;
+            buf.as_mut_slice().fill(2u8);
+            new_log.append(buf.as_ref())?;
+            assert_eq!(new_log.nblocks(), 4);
+            Ok(new_log.id())
+        });
+        let log_id = res?;
+        tx.commit()?;
+
+        // TX 2: update the log (committed)
+        let mut tx = raw_log_store.new_tx();
+        let res: Result<_> = tx.context(|| {
+            let log = raw_log_store.open_log(log_id, true)?;
+            let mut buf = Buf::alloc(1)?;
+            buf.as_mut_slice().fill(3u8);
+            log.update(1, buf.as_ref())?;
+            Ok(())
+        });
+        res?;
+        tx.commit()?;
+
+        let entry = find_persistent_log_entry(&raw_log_store, log_id).unwrap();
+        assert_eq!(entry.head.num_blocks, 4);
+
+        let mut expected = Buf::alloc(1)?;
+        expected.as_mut_slice().fill(3u8);
+        let mut tx = raw_log_store.new_tx();
+        let res: Result<_> = tx.context(|| {
+            let log = raw_log_store.open_log(log_id, true)?;
+            let mut buf = Buf::alloc(1)?;
+            log.read(1, buf.as_mut())?;
+            assert_eq!(buf.as_slice(), expected.as_slice());
+            Ok(())
+        });
+        res?;
+        tx.commit()?;
+
+        Ok(())
     }
 
     #[test]

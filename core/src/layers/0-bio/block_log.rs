@@ -22,6 +22,8 @@ pub trait BlockLog: Sync + Send {
     /// returning the ID of the first newly-appended block.
     fn append(&self, buf: BufRef) -> Result<BlockId>;
 
+    fn update(&self, offset: BlockId, buf: BufRef) -> Result<()>;
+
     /// Ensure that blocks are persisted to the disk.
     fn flush(&self) -> Result<()>;
 
@@ -35,6 +37,7 @@ macro_rules! impl_blocklog_for {
         impl<T: BlockLog> BlockLog for $typ {
             fn read(&self, pos: BlockId, buf: BufMut) -> Result<()>;
             fn append(&self, buf: BufRef) -> Result<BlockId>;
+            fn update(&self, offset: BlockId, buf: BufRef) -> Result<()>;
             fn flush(&self) -> Result<()>;
             fn nblocks(&self) -> usize;
         }
@@ -61,6 +64,18 @@ impl BlockLog for MemLog {
         let log = self.log.lock();
         let read_buf = &log.as_slice()[Self::offset(pos)..Self::offset(pos) + nblocks * BLOCK_SIZE];
         buf.as_mut_slice().copy_from_slice(&read_buf);
+        Ok(())
+    }
+
+    fn update(&self, offset: BlockId, buf: BufRef) -> Result<()> {
+        let nblocks = buf.nblocks();
+        if offset + nblocks > self.nblocks() {
+            return_errno_with_msg!(InvalidArgs, "update range out of bound");
+        }
+        let mut log = self.log.lock();
+        let write_buf =
+            &mut log.as_mut_slice()[Self::offset(offset)..Self::offset(offset) + nblocks * BLOCK_SIZE];
+        write_buf.copy_from_slice(buf.as_slice());
         Ok(())
     }
 
