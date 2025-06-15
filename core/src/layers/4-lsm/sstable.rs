@@ -14,6 +14,9 @@ use core::ops::RangeInclusive;
 use lru::LruCache;
 use pod::Pod;
 
+const ENABLED_CACHING: bool = true;
+const CACHE_CAP: usize = 128;
+
 /// Sorted String Table (SST) for `TxLsmTree`.
 ///
 /// Responsible for storing, managing key-value records on a `TxLog` (L3).
@@ -112,7 +115,7 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
     const MIN_RECORD_SIZE: usize = BID_SIZE + Self::FLAG_SIZE + Self::V_SIZE;
     const MAX_RECORD_SIZE: usize = BID_SIZE + Self::FLAG_SIZE + 2 * Self::V_SIZE;
     const INDEX_ENTRY_SIZE: usize = BID_SIZE + 2 * Self::K_SIZE;
-    const CACHE_CAP: usize = 1;
+    const CACHE_CAP: usize = CACHE_CAP;
 
     /// Return the ID of this `SSTable`, which is the same ID
     /// to the underlying `TxLog`.
@@ -244,12 +247,15 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
         if let Some(cached_rb) = cache.get(&target_pos) {
             Ok(cached_rb.clone())
         } else {
+            debug!("miss cache for record block at pos {}", target_pos);
             let mut rb = RecordBlock::from_buf(vec![0; RECORD_BLOCK_SIZE]);
             // TODO: Avoid opening the log on every call
             let tx_log = tx_log_store.open_log(self.id, false)?;
             tx_log.read(target_pos, BufMut::try_from(rb.as_mut_slice()).unwrap())?;
             let rb = Arc::new(rb);
-            cache.put(target_pos, rb.clone());
+            if ENABLED_CACHING {
+                cache.put(target_pos, rb.clone());
+            }
             Ok(rb)
         }
     }
@@ -445,7 +451,9 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
             let record_block = RecordBlock::from_buf(buf.clone());
 
             tx_log.append(BufRef::try_from(record_block.as_slice()).unwrap())?;
-            cache.put(entry.pos, Arc::new(record_block));
+            // if ENABLED_CACHING {
+            //     cache.put(entry.pos, Arc::new(record_block));
+            // }
             Ok(())
         }
 
@@ -518,6 +526,8 @@ impl<K: RecordKey<K>, V: RecordValue> SSTable<K, V> {
                 K::from_bytes(&buf[Self::INDEX_ENTRY_SIZE - Self::K_SIZE..Self::INDEX_ENTRY_SIZE]);
 
             tx_log.read(pos, BufMut::try_from(&mut record_block[..]).unwrap())?;
+
+            // always cache the record block when building from TxLog
             let _ = cache.put(pos, Arc::new(RecordBlock::from_buf(record_block.clone())));
 
             index.push(IndexEntry { pos, first, last })

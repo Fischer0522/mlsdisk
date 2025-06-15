@@ -136,7 +136,8 @@ pub(super) trait AsKVex<K, V> {
 }
 
 /// Capacity of each `MemTable` and `SSTable`.
-pub(super) const MEMTABLE_CAPACITY: usize = 262144; // 12 MiB MemTable, cover 1 GiB data // TBD
+//pub(super) const MEMTABLE_CAPACITY: usize = 524288; // 24 MiB MemTable, cover 1 GiB data // TBD
+pub(super) const MEMTABLE_CAPACITY: usize = 2097152;
 pub(super) const SSTABLE_CAPACITY: usize = MEMTABLE_CAPACITY;
 
 impl<K: RecordKey<K>, V: RecordValue, D: BlockSet + 'static> TxLsmTree<K, V, D> {

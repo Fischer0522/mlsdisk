@@ -6,6 +6,7 @@ use crate::prelude::*;
 use core::any::Any;
 use core::cell::RefCell;
 use core::mem::size_of;
+use std::time::Instant;
 use pod::Pod;
 use serde::{Deserialize, Serialize};
 use static_assertions::const_assert;
@@ -74,6 +75,10 @@ use static_assertions::const_assert;
 /// So the disk space wasted by such `CryptoLog` is bounded.
 /// And after such `CryptoLog`s are done writing, they will be read once and
 /// then discarded.
+/// 
+
+const ENABLED_CACHING: bool = false;
+
 pub struct CryptoLog<L> {
     mht: RwLock<Mht<L>>,
 }
@@ -347,7 +352,7 @@ impl<L: BlockLog> Mht<L> {
         if search_ctx.is_completed {
             return Ok(());
         }
-
+        //info!("search in MHT, height{}", root_node.height());
         // Search the MHT if needed
         self.search_hierarchy(vec![root_node.clone()], root_node.height(), search_ctx)
     }
@@ -476,7 +481,9 @@ impl<L: BlockLog> MhtStorage<L> {
         };
 
         let pos = self.block_log.append(cipher.as_ref())?;
-        self.node_cache.put(pos, node.clone());
+        if ENABLED_CACHING {
+            self.node_cache.put(pos, node.clone());
+        }
         Ok(RootMhtMeta { pos, mac, iv })
     }
 
@@ -493,6 +500,9 @@ impl<L: BlockLog> MhtStorage<L> {
             let mac = Aead::new().encrypt(&plain, &key, &Iv::new_zeroed(), &[], cipher)?;
 
             node_entries.push(MhtNodeEntry { pos, key, mac });
+            if ENABLED_CACHING {
+                self.node_cache.put(pos, node.clone());
+            }
             self.node_cache.put(pos, node.clone());
             pos += 1;
         }
@@ -532,7 +542,7 @@ impl<L: BlockLog> MhtStorage<L> {
                 Error::with_msg(InvalidArgs, "cache node downcasts to MHT node failed")
             })?);
         }
-
+        //info!("miss cache for MHT node at pos {}", pos);
         let mht_node = {
             let mut cipher = self.crypt_buf.cipher.borrow_mut();
             let mut plain = self.crypt_buf.plain.borrow_mut();
@@ -541,7 +551,9 @@ impl<L: BlockLog> MhtStorage<L> {
             Arc::new(MhtNode::from_bytes(plain.as_slice()))
         };
 
-        self.node_cache.put(pos, mht_node.clone());
+        if ENABLED_CACHING {
+            self.node_cache.put(pos, mht_node.clone());
+        }
         Ok(mht_node)
     }
 
