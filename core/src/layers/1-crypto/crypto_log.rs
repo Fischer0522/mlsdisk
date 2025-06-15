@@ -1,6 +1,6 @@
 use super::{Iv, Key, Mac};
 use crate::layers::bio::{BlockId, BlockLog, Buf, BufMut, BufRef, BLOCK_SIZE};
-use crate::layers::crypto::mht::MHTInterface;
+use crate::layers::crypto::mht::{CacheEntry, MHTInterface};
 use crate::os::{Aead, HashMap, RwLock};
 use crate::prelude::*;
 
@@ -178,15 +178,15 @@ struct PreviousBuild<'a, L> {
 /// can achieve TX-awareness.
 pub trait NodeCache {
     /// Gets an owned value from cache corresponding to the position.
-    fn get(&self, pos: Pbid) -> Option<Arc<dyn Any + Send + Sync>>;
+    fn get(&self, pos: Pbid) -> Option<CacheEntry>;
 
     /// Puts a position-value pair into cache. If the value of that position
     /// already exists, updates it and returns the old value. Otherwise, `None` is returned.
     fn put(
         &self,
         pos: Pbid,
-        value: Arc<dyn Any + Send + Sync>,
-    ) -> Option<Arc<dyn Any + Send + Sync>>;
+        value: CacheEntry,
+    ) -> Option<CacheEntry>;
 }
 
 /// Context for a search request.
@@ -516,7 +516,7 @@ impl<L: BlockLog> MhtStorage<L> {
 
         let pos = self.block_log.append(cipher.as_ref())?;
         if ENABLED_CACHING {
-            self.node_cache.put(pos, node.clone());
+            self.node_cache.put(pos, CacheEntry::MhtNode(node.clone()));
         }
         Ok(RootMhtMeta { pos, mac, iv })
     }
@@ -535,9 +535,8 @@ impl<L: BlockLog> MhtStorage<L> {
 
             node_entries.push(MhtNodeEntry { pos, key, mac });
             if ENABLED_CACHING {
-                self.node_cache.put(pos, node.clone());
+                self.node_cache.put(pos, CacheEntry::MhtNode(node.clone()));
             }
-            self.node_cache.put(pos, node.clone());
             pos += 1;
         }
 
@@ -571,10 +570,8 @@ impl<L: BlockLog> MhtStorage<L> {
     }
 
     fn read_mht_node(&self, pos: Pbid, key: &Key, mac: &Mac, iv: &Iv) -> Result<Arc<MhtNode>> {
-        if let Some(node) = self.node_cache.get(pos) {
-            return Ok(node.downcast::<MhtNode>().map_err(|_| {
-                Error::with_msg(InvalidArgs, "cache node downcasts to MHT node failed")
-            })?);
+        if let Some(CacheEntry::MhtNode(node)) = self.node_cache.get(pos) {
+            return Ok(node);
         }
         //info!("miss cache for MHT node at pos {}", pos);
         let mht_node = {
@@ -586,7 +583,7 @@ impl<L: BlockLog> MhtStorage<L> {
         };
 
         if ENABLED_CACHING {
-            self.node_cache.put(pos, mht_node.clone());
+            self.node_cache.put(pos, CacheEntry::MhtNode(mht_node.clone()));
         }
         Ok(mht_node)
     }
@@ -1119,14 +1116,14 @@ mod tests {
 
     struct NoCache;
     impl NodeCache for NoCache {
-        fn get(&self, _pos: Pbid) -> Option<Arc<dyn Any + Send + Sync>> {
+        fn get(&self, _pos: Pbid) -> Option<CacheEntry> {
             None
         }
         fn put(
             &self,
             _pos: Pbid,
-            _value: Arc<dyn Any + Send + Sync>,
-        ) -> Option<Arc<dyn Any + Send + Sync>> {
+            _value: CacheEntry,
+        ) -> Option<CacheEntry> {
             None
         }
     }

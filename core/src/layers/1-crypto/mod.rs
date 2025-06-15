@@ -8,6 +8,7 @@ mod mht;
 pub use self::crypto_blob::CryptoBlob;
 pub use self::crypto_chain::CryptoChain;
 pub use self::crypto_log::{CryptoLog, NodeCache, RootMhtMeta};
+pub use self::mht::CacheEntry;
 
 pub type Key = crate::os::AeadKey;
 pub type Iv = crate::os::AeadIv;

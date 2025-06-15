@@ -62,7 +62,7 @@ use self::journaling::{AllEdit, AllState, Journal, JournalCompactPolicy};
 use super::chunk::{ChunkAlloc, ChunkAllocEdit, ChunkAllocState};
 use super::raw_log::{RawLog, RawLogId, RawLogStore, RawLogStoreEdit, RawLogStoreState};
 use crate::layers::bio::{BlockId, BlockSet, Buf, BufMut, BufRef};
-use crate::layers::crypto::{CryptoLog, NodeCache, RootMhtMeta};
+use crate::layers::crypto::{CacheEntry, CryptoLog, NodeCache, RootMhtMeta};
 use crate::layers::edit::{CompactPolicy, Edit, EditJournal, EditJournalMeta};
 use crate::layers::log::chunk::CHUNK_NBLOCKS;
 use crate::os::{AeadKey as Key, HashMap, HashSet, Mutex, Skcipher, SkcipherIv, SkcipherKey};
@@ -864,7 +864,7 @@ pub struct CryptoLogCache {
 }
 
 pub(super) struct CacheInner {
-    pub lru_cache: LruCache<BlockId, Arc<dyn Any + Send + Sync>>,
+    pub lru_cache: LruCache<BlockId, CacheEntry>,
 }
 
 impl CryptoLogCache {
@@ -878,7 +878,7 @@ impl CryptoLogCache {
 }
 
 impl NodeCache for CryptoLogCache {
-    fn get(&self, pos: BlockId) -> Option<Arc<dyn Any + Send + Sync>> {
+    fn get(&self, pos: BlockId) -> Option<CacheEntry> {
         let mut current = self.tx_provider.current();
 
         let value_opt = current.data_mut_with(|open_cache_table: &mut OpenLogCache| {
@@ -899,8 +899,8 @@ impl NodeCache for CryptoLogCache {
     fn put(
         &self,
         pos: BlockId,
-        value: Arc<dyn Any + Send + Sync>,
-    ) -> Option<Arc<dyn Any + Send + Sync>> {
+        value: CacheEntry,
+    ) -> Option<CacheEntry> {
         let mut current = self.tx_provider.current();
 
         current.data_mut_with(|open_cache_table: &mut OpenLogCache| {

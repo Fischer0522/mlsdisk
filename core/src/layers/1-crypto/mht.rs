@@ -14,6 +14,12 @@ pub trait MHTInterface<L> {
 
 }
 
+#[derive(Clone)]
+pub enum CacheEntry {
+    MhtNode(Arc<MhtNode>),
+    DataNode(Arc<DataNode>),
+}
+
 // In-place MHT
 pub struct IMht {
     root: Option<(RootMhtMeta, Arc<MhtNode>)>,
