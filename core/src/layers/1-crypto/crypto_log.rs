@@ -1,5 +1,6 @@
 use super::{Iv, Key, Mac};
 use crate::layers::bio::{BlockId, BlockLog, Buf, BufMut, BufRef, BLOCK_SIZE};
+use crate::layers::crypto::mht::MHTInterface;
 use crate::os::{Aead, HashMap, RwLock};
 use crate::prelude::*;
 
@@ -80,7 +81,7 @@ use static_assertions::const_assert;
 const ENABLED_CACHING: bool = false;
 
 pub struct CryptoLog<L> {
-    mht: RwLock<Mht<L>>,
+    mht: RwLock<Box<dyn MHTInterface<L>>>,
 }
 
 type Lbid = BlockId; // Logical block position, in terms of user
@@ -114,7 +115,7 @@ pub struct RootMhtMeta {
 /// It contains a header for node metadata and a bunch of entries for managing children nodes.
 #[repr(C)]
 #[derive(Clone, Copy, Pod)]
-struct MhtNode {
+pub struct MhtNode {
     header: MhtNodeHeader,
     entries: [MhtNodeEntry; MHT_NBRANCHES],
 }
@@ -123,7 +124,7 @@ const_assert!(size_of::<MhtNode>() <= BLOCK_SIZE);
 /// The header contains metadata of the current MHT node.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
-struct MhtNodeHeader {
+pub struct MhtNodeHeader {
     // The height of the MHT whose root is this node
     height: Height,
     // The total number of valid data nodes covered by this node
@@ -136,7 +137,7 @@ struct MhtNodeHeader {
 /// metadata of the child MHT/data node.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
-struct MhtNodeEntry {
+pub struct MhtNodeEntry {
     pos: Pbid,
     key: Key,
     mac: Mac,
@@ -148,7 +149,7 @@ const MHT_NBRANCHES: usize = (BLOCK_SIZE - size_of::<MhtNodeHeader>()) / size_of
 /// The data node (leaf). It contains a block of data.
 #[repr(C)]
 #[derive(Clone, Copy, Pod)]
-struct DataNode([u8; BLOCK_SIZE]);
+pub struct DataNode([u8; BLOCK_SIZE]);
 
 /// Builder for MHT.
 struct TreeBuilder<'a, L> {
@@ -189,7 +190,7 @@ pub trait NodeCache {
 }
 
 /// Context for a search request.
-struct SearchCtx<'a> {
+pub struct SearchCtx<'a> {
     pub pos: Lbid,
     pub data_buf: BufMut<'a>,
     pub offset: usize,
@@ -203,14 +204,14 @@ struct CryptBuf {
     pub cipher: RefCell<Buf>,
 }
 
-impl<L: BlockLog> CryptoLog<L> {
+impl<L: BlockLog + 'static> CryptoLog<L> {
     /// Creates a new `CryptoLog`.
     ///
     /// A newly-created instance won't occupy any space on the `block_log`
     /// until the first flush, which triggers writing the root MHT node.
     pub fn new(block_log: L, root_key: Key, node_cache: Arc<dyn NodeCache>) -> Self {
         Self {
-            mht: RwLock::new(Mht::new(block_log, root_key, node_cache)),
+            mht: RwLock::new(Box::new(Mht::new(block_log, root_key, node_cache))),
         }
     }
 
@@ -225,13 +226,13 @@ impl<L: BlockLog> CryptoLog<L> {
         node_cache: Arc<dyn NodeCache>,
     ) -> Result<Self> {
         Ok(Self {
-            mht: RwLock::new(Mht::open(block_log, root_key, root_meta, node_cache)?),
+            mht: RwLock::new(Box::new(Mht::open(block_log, root_key, root_meta, node_cache)?)),
         })
     }
 
     /// Gets the root key.
     pub fn root_key(&self) -> Key {
-        self.mht.read().root_key
+        self.mht.read().root_key()
     }
 
     /// Gets the metadata of the root MHT node.
@@ -287,6 +288,39 @@ impl<L: BlockLog> CryptoLog<L> {
 
     pub fn display_mht(&self) {
         self.mht.read().display();
+    }
+}
+
+impl<L: BlockLog> MHTInterface<L> for Mht<L> {
+    fn root_key(&self) -> Key {
+        self.root_key
+    }
+
+    fn root_meta(&self) -> Option<RootMhtMeta> {
+        self.root_meta()
+    }
+
+    fn root_node(&self) -> Option<&Arc<MhtNode>> {
+        self.root_node()
+    }
+
+    fn total_data_nodes(&self) -> usize {
+        self.total_data_nodes()
+    }
+
+    fn search(&self, search_ctx: &mut SearchCtx<'_>) -> Result<()> {
+        self.search(search_ctx)
+    }
+
+    fn append_data_nodes(&mut self, data_nodes: Vec<Arc<DataNode>>) -> Result<()> {
+        self.append_data_nodes(data_nodes)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.flush()
+    }
+    fn display(&self) {
+        self.display()
     }
 }
 
@@ -994,7 +1028,7 @@ impl<L: BlockLog> AppendDataBuf<L> {
 impl<L: BlockLog> Debug for CryptoLog<L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CryptoLog")
-            .field("mht", &self.mht.read())
+            .field("mht", &self.mht.read().display())
             .finish()
     }
 }
