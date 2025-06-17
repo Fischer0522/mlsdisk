@@ -35,6 +35,7 @@ struct IMhtStorage<L> {
     block_log: L,
     node_cache: Arc<dyn NodeCache>,
     crypt_buf: CryptBuf,
+    offset: usize,
 }
 
 impl<L: BlockLog + 'static> IMhtStorage<L> {
@@ -43,6 +44,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
             block_log,
             node_cache,
             crypt_buf: CryptBuf::new(),
+            offset: 0,
         }
     }
 
@@ -54,7 +56,8 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
     }
 
     pub fn append_root_mht_node(&self, root_key: &Key, node: &Arc<MhtNode>) -> Result<RootMhtMeta> {
-        unimplemented!("append_root_mht_node");
+        // always store root node at position 0
+        let pos = 0;
         let (cipher, mac, iv) = {
             let plain = node.as_bytes();
             let mut cipher = self.crypt_buf.cipher.borrow_mut();
@@ -63,40 +66,31 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
             (cipher, mac, iv)
         };
 
-        let pos = self.block_log.append(cipher.as_ref())?;
+        self.block_log.update(pos,cipher.as_ref())?;
         if ENABLED_CACHING {
             self.node_cache.put(pos, Node::MhtNode(node.clone()));
         }
         Ok(RootMhtMeta { pos, mac, iv })
     }
 
-    fn append_mht_nodes(&self, nodes: &[Arc<MhtNode>]) -> Result<Vec<MhtNodeEntry>> {
-        unimplemented!("append_mht_nodes");
-        let num_append = nodes.len();
-        let mut node_entries = Vec::with_capacity(num_append);
-        let mut cipher_buf = Buf::alloc(num_append)?;
-        let mut pos = self.block_log.nblocks() as BlockId;
-        let start_pos = pos;
-        for (i, node) in nodes.iter().enumerate() {
+    fn update_mht_node(&self, pos: BlockId,node: &Arc<MhtNode>) -> Result<MhtNodeEntry> {
+        let (cipher, entry) = {
             let plain = node.as_bytes();
-            let cipher = &mut cipher_buf.as_mut_slice()[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
+            let mut cipher = self.crypt_buf.cipher.borrow_mut();
+            let iv = Iv::random();
             let key = Key::random();
-            let mac = Aead::new().encrypt(&plain, &key, &Iv::new_zeroed(), &[], cipher)?;
+            let mac = Aead::new().encrypt(&plain, &key, &iv, &[], cipher.as_mut_slice())?;
+            (cipher, MhtNodeEntry { pos, key, mac })
+        };
 
-            node_entries.push(MhtNodeEntry { pos, key, mac });
-            if ENABLED_CACHING {
-                self.node_cache.put(pos, Node::MhtNode(node.clone()));
-            }
-            pos += 1;
+        self.block_log.update(pos,cipher.as_ref())?;
+        if ENABLED_CACHING {
+            self.node_cache.put(pos, Node::MhtNode(node.clone()));
         }
-
-        let append_pos = self.block_log.append(cipher_buf.as_ref())?;
-        debug_assert_eq!(start_pos, append_pos);
-        Ok(node_entries)
+        Ok(entry)
     }
 
     fn append_data_nodes(&self, nodes: &[Arc<DataNode>]) -> Result<Vec<MhtNodeEntry>> {
-        unimplemented!("append_data_nodes");
         let num_append = nodes.len();
         let mut node_entries = Vec::with_capacity(num_append);
         if num_append == 0 {
@@ -119,9 +113,21 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
         debug_assert_eq!(start_pos, append_pos);
         Ok(node_entries)
     }
+    fn append_data_node(&self, node: &Arc<DataNode>) -> Result<MhtNodeEntry> {
+        let (entry) = {
+            let mut cipher = self.crypt_buf.cipher.borrow_mut();
+            let key = Key::random();
+            let mac = Aead::new().encrypt(&node.0, &key, &Iv::new_zeroed(), &[], cipher.as_mut_slice())?;
+            let pos = self.block_log.append(cipher.as_ref())?;
+            (MhtNodeEntry { pos, key, mac })
+        };
+        if ENABLED_CACHING {
+            self.node_cache.put(entry.pos, Node::DataNode(node.clone()));
+        }
+        Ok(entry)
+    }
 
     fn read_mht_node(&self, pos: Pbid, key: &Key, mac: &Mac, iv: &Iv) -> Result<Arc<MhtNode>> {
-        unimplemented!("read_mht_node");
         if let Some(Node::MhtNode(node)) = self.node_cache.get(pos) {
             return Ok(node);
         }
