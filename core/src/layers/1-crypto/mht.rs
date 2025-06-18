@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use super::{Iv, Key, Mac};
-use crate::{layers::{bio::BlockLog, crypto::{crypto_log::{CryptBuf, DataNode, MhtNode, MhtNodeEntry, Pbid, SearchCtx}, NodeCache, RootMhtMeta}}, Aead, Buf};
+use crate::{layers::{bio::BlockLog, crypto::{crypto_log::{CryptBuf, DataNode, MhtNode, MhtNodeEntry, Pbid, SearchCtx, MHT_NBRANCHES}, NodeCache, RootMhtMeta}}, Aead, Buf};
 use crate::prelude::*;
 use pod::Pod;
 
@@ -32,19 +32,23 @@ pub struct IMht<L> {
 }
 
 struct IMhtStorage<L> {
+    root: Option<(RootMhtMeta, Arc<MhtNode>)>,
+    root_key: Key,
     block_log: L,
     node_cache: Arc<dyn NodeCache>,
     crypt_buf: CryptBuf,
-    offset: usize,
+    logical_offset: usize,
 }
 
 impl<L: BlockLog + 'static> IMhtStorage<L> {
-    pub fn new(block_log: L, node_cache: Arc<dyn NodeCache>) -> Self {
+    pub fn new(root: Option<(RootMhtMeta, Arc<MhtNode>)>, root_key: Key, block_log: L, node_cache: Arc<dyn NodeCache>) -> Self {
         Self {
+            root: None,
+            root_key: Key::random(),
             block_log,
             node_cache,
             crypt_buf: CryptBuf::new(),
-            offset: 0,
+            logical_offset: 0,
         }
     }
 
@@ -52,7 +56,8 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
         self.block_log.flush()
     }
      pub fn root_mht_node(&self, root_key: &Key, root_meta: &RootMhtMeta) -> Result<Arc<MhtNode>> {
-        self.read_mht_node(root_meta.pos, root_key, &root_meta.mac, &root_meta.iv)
+        todo!()
+      //zw  self.read_mht_node(root_meta.pos, root_key, &root_meta.mac, &root_meta.iv)
     }
 
     pub fn append_root_mht_node(&self, root_key: &Key, node: &Arc<MhtNode>) -> Result<RootMhtMeta> {
@@ -127,24 +132,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
         Ok(entry)
     }
 
-    fn read_mht_node(&self, pos: Pbid, key: &Key, mac: &Mac, iv: &Iv) -> Result<Arc<MhtNode>> {
-        if let Some(Node::MhtNode(node)) = self.node_cache.get(pos) {
-            return Ok(node);
-        }
-        //info!("miss cache for MHT node at pos {}", pos);
-        let mht_node = {
-            let mut cipher = self.crypt_buf.cipher.borrow_mut();
-            let mut plain = self.crypt_buf.plain.borrow_mut();
-            self.block_log.read(pos, cipher.as_mut())?;
-            Aead::new().decrypt(cipher.as_slice(), key, iv, &[], mac, plain.as_mut_slice())?;
-            Arc::new(MhtNode::from_bytes(plain.as_slice()))
-        };
 
-        if ENABLED_CACHING {
-            self.node_cache.put(pos, Node::MhtNode(mht_node.clone()));
-        }
-        Ok(mht_node)
-    }
 
     fn read_data_node(&self, entry: &MhtNodeEntry, node_buf: &mut [u8]) -> Result<()> {
         todo!()
@@ -153,6 +141,95 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
     fn get_data_node(&self, entry: &MhtNodeEntry, node_buf: &mut [u8]) -> Result<()> {
         todo!()
     }
+
+    fn append_mht_node(&self, logical_number: u64) -> Result<Arc<MhtNode>> {
+        let physical_number = logical_number * (MHT_NBRANCHES as u64 + 1);
+        let mht_node = Arc::new(MhtNode::new_uninit());
+        self.node_cache.put(physical_number as usize, Node::MhtNode(mht_node.clone()));
+        Ok(mht_node)
+    }
+
+    fn read_mht_node(&self, logical_number: u64) -> Result<Arc<MhtNode>> {
+        if (logical_number == 0) {
+            return Ok(self.root.as_ref().unwrap().1.clone());
+        }
+        let physical_number = logical_number * (MHT_NBRANCHES as u64 + 1);
+        if let Some(Node::MhtNode(node)) = self.node_cache.get(physical_number as usize) {
+            return Ok(node);
+        }
+
+        // iter from root to target node
+        let mut parent_node = self.root.as_ref().unwrap().1.clone();
+
+        for i in 1..logical_number {
+            let physical_number = i * (MHT_NBRANCHES as u64 + 1);
+            if let Some(Node::MhtNode(node)) = self.node_cache.get(physical_number as usize) {
+                parent_node = node;
+            } else {
+                let mut cipher = self.crypt_buf.cipher.borrow_mut();
+                let mut plain = self.crypt_buf.plain.borrow_mut();
+                let current_node = self.block_log.read(physical_number as usize, cipher.as_mut())?;
+
+            }
+        }
+        todo!()
+        //info!("miss cache for MHT node at pos {}", pos);
+        // let mht_node = {
+        //     let mut cipher = self.crypt_buf.cipher.borrow_mut();
+        //     let mut plain = self.crypt_buf.plain.borrow_mut();
+        //     self.block_log.read(pos, cipher.as_mut())?;
+        //     Aead::new().decrypt(cipher.as_slice(), key, iv, &[], mac, plain.as_mut_slice())?;
+        //     Arc::new(MhtNode::from_bytes(plain.as_slice()))
+        // };
+
+        // if ENABLED_CACHING {
+        //     self.node_cache.put(pos, Node::MhtNode(mht_node.clone()));
+        // }
+    }
+
+
+    fn get_mht_node(&self, logical_number: u64) -> Result<Arc<MhtNode>> {
+        let mut parent_node = None;
+        for i in 0..logical_number {
+            let physical_number = logical_number * (MHT_NBRANCHES as u64 + 1);
+            // root node
+            if let Some(Node::MhtNode(parent)) = self.node_cache.get(physical_number as usize) {
+                parent_node = Some(parent);
+            } else {
+
+            }
+        }
+        todo!()
+    }
+
+    fn get_node_numbers(&self) -> (u64, u64, u64, u64) {
+    if self.logical_offset < 1 {
+        return (0, 0, 0, 0);
+    }
+
+    // node 0 - mht
+    // nodes 1-102 - data (MHT_NBRANCHES == 102)
+    // node 103 - mht
+    // node 104-205 - data
+    // etc.
+    let data_logic_number = self.logical_offset  as u64;
+    let mht_logic_number = data_logic_number / MHT_NBRANCHES as u64;
+
+    // + 1 - mht root
+    // + mht_logic_number - number of mht nodes in the middle (the root mht mht_node_number is 0)
+    let data_physical_number = data_logic_number + 1 + mht_logic_number;
+
+    let mht_physical_number =
+        data_physical_number - data_logic_number % MHT_NBRANCHES as u64 - 1;
+
+
+    (
+        mht_logic_number,
+        data_logic_number,
+        mht_physical_number,
+        data_physical_number,
+    )
+}
 }
 
 
@@ -161,7 +238,7 @@ impl<L: BlockLog + 'static> IMht<L> {
         Self {
             root: None,
             root_key,
-            storage: Arc::new(IMhtStorage::new(block_log, node_cache)),
+            storage: Arc::new(IMhtStorage::new(None, root_key, block_log, node_cache)),
         }
     }
 

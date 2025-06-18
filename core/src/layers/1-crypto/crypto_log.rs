@@ -119,6 +119,18 @@ pub struct MhtNode {
     header: MhtNodeHeader,
     entries: [MhtNodeEntry; MHT_NBRANCHES],
 }
+
+impl MhtNode {
+    pub fn child_node_entry(&self,logical_number: u64) -> Option<MhtNodeEntry> {
+        
+        if logical_number == 0 {
+            return None;
+        }
+        let idx = logical_number as usize % MHT_NBRANCHES;
+
+        Some(self.entries[idx])
+    }
+}
 const_assert!(size_of::<MhtNode>() <= BLOCK_SIZE);
 
 /// The header contains metadata of the current MHT node.
@@ -144,7 +156,7 @@ pub struct MhtNodeEntry {
 }
 
 // Number of branches of one MHT node. (102 for now)
-const MHT_NBRANCHES: usize = (BLOCK_SIZE - size_of::<MhtNodeHeader>()) / size_of::<MhtNodeEntry>();
+pub const MHT_NBRANCHES: usize = (BLOCK_SIZE - size_of::<MhtNodeHeader>()) / size_of::<MhtNodeEntry>();
 
 /// The data node (leaf). It contains a block of data.
 #[repr(C)]
