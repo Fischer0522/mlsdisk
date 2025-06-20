@@ -113,9 +113,26 @@ pub struct RootMhtMeta {
 
 /// The Merkle-Hash Tree (MHT) node (internal).
 /// It contains a header for node metadata and a bunch of entries for managing children nodes.
+
+pub struct MhtNode {
+    pub inner: MhtInner,
+    pub block_id: Pbid,
+    pub parent: Option<Arc<MhtNode>>,
+}
+
+impl MhtNode {
+    pub fn new_uninit() -> Self {
+        Self {
+            inner: MhtInner::new_uninit(),
+            block_id: 0,
+            parent: None,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod)]
-pub struct MhtNode {
+pub struct MhtInner {
     header: MhtNodeHeader,
     entries: [MhtNodeEntry; MHT_NBRANCHES],
 }
@@ -128,10 +145,10 @@ impl MhtNode {
         }
         let idx = logical_number as usize % MHT_NBRANCHES;
 
-        Some(self.entries[idx])
+        Some(self.inner.entries[idx])
     }
 }
-const_assert!(size_of::<MhtNode>() <= BLOCK_SIZE);
+const_assert!(size_of::<MhtInner>() <= BLOCK_SIZE);
 
 /// The header contains metadata of the current MHT node.
 #[repr(C)]
@@ -158,10 +175,29 @@ pub struct MhtNodeEntry {
 // Number of branches of one MHT node. (102 for now)
 pub const MHT_NBRANCHES: usize = (BLOCK_SIZE - size_of::<MhtNodeHeader>()) / size_of::<MhtNodeEntry>();
 
+
+
 /// The data node (leaf). It contains a block of data.
+
+pub struct DataNode {
+    pub inner: DataInner,
+    pub block_id: Pbid,
+    pub parent: Option<Arc<MhtNode>>,
+}
+
+impl DataNode {
+    pub fn new_uninit() -> Self {
+        Self {
+            inner: DataInner::new_uninit(),
+            block_id: 0,
+            parent: None,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod)]
-pub struct DataNode(pub [u8; BLOCK_SIZE]);
+pub struct DataInner (pub [u8; BLOCK_SIZE]);
 
 /// Builder for MHT.
 struct TreeBuilder<'a, L> {
@@ -279,7 +315,7 @@ impl<L: BlockLog + 'static> CryptoLog<L> {
             .map(|block_buf| {
                 let data_node = {
                     let mut node = DataNode::new_uninit();
-                    node.0.copy_from_slice(block_buf.as_slice());
+                    node.inner.0.copy_from_slice(block_buf.as_slice());
                     Arc::new(node)
                 };
                 data_node
@@ -428,7 +464,7 @@ impl<L: BlockLog> Mht<L> {
 
         let target_entries = level_targets
             .iter()
-            .flat_map(|node| node.entries.iter())
+            .flat_map(|node| node.inner.entries.iter())
             .skip(nodes_skipped)
             .take(nodes_needed);
 
@@ -519,7 +555,7 @@ impl<L: BlockLog> MhtStorage<L> {
 
     pub fn append_root_mht_node(&self, root_key: &Key, node: &Arc<MhtNode>) -> Result<RootMhtMeta> {
         let (cipher, mac, iv) = {
-            let plain = node.as_bytes();
+            let plain = node.inner.as_bytes();
             let mut cipher = self.crypt_buf.cipher.borrow_mut();
             let iv = Iv::random();
             let mac = Aead::new().encrypt(&plain, root_key, &iv, &[], cipher.as_mut_slice())?;
@@ -540,7 +576,7 @@ impl<L: BlockLog> MhtStorage<L> {
         let mut pos = self.block_log.nblocks() as BlockId;
         let start_pos = pos;
         for (i, node) in nodes.iter().enumerate() {
-            let plain = node.as_bytes();
+            let plain = node.inner.as_bytes();
             let cipher = &mut cipher_buf.as_mut_slice()[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
             let key = Key::random();
             let mac = Aead::new().encrypt(&plain, &key, &Iv::new_zeroed(), &[], cipher)?;
@@ -570,7 +606,7 @@ impl<L: BlockLog> MhtStorage<L> {
         for (i, node) in nodes.iter().enumerate() {
             let cipher = &mut cipher_buf.as_mut_slice()[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
             let key = Key::random();
-            let mac = Aead::new().encrypt(&node.0, &key, &Iv::new_zeroed(), &[], cipher)?;
+            let mac = Aead::new().encrypt(&node.inner.0, &key, &Iv::new_zeroed(), &[], cipher)?;
 
             node_entries.push(MhtNodeEntry { pos, key, mac });
             pos += 1;
@@ -591,7 +627,7 @@ impl<L: BlockLog> MhtStorage<L> {
             let mut plain = self.crypt_buf.plain.borrow_mut();
             self.block_log.read(pos, cipher.as_mut())?;
             Aead::new().decrypt(cipher.as_slice(), key, iv, &[], mac, plain.as_mut_slice())?;
-            Arc::new(MhtNode::from_bytes(plain.as_slice()))
+            Arc::new(MhtNode { inner: MhtInner::from_bytes(plain.as_slice()), block_id: pos, parent: None })
         };
 
         if ENABLED_CACHING {
@@ -618,15 +654,15 @@ impl<L: BlockLog> MhtStorage<L> {
 
 impl MhtNode {
     pub fn height(&self) -> Height {
-        self.header.height
+        self.inner.header.height
     }
 
     pub fn num_data_nodes(&self) -> usize {
-        self.header.num_data_nodes as _
+        self.inner.header.num_data_nodes as _
     }
 
     pub fn num_valid_entries(&self) -> usize {
-        self.header.num_valid_entries as _
+        self.inner.header.num_valid_entries as _
     }
 
     // Lowest level MHT node's children are data nodes
@@ -760,7 +796,7 @@ impl LevelBuilder {
             if let Some(pre_node) = self.previous_incomplete_node.as_ref() {
                 // If there exists a previous built node (same height),
                 // its complete entries should participate in the building
-                pre_node
+                pre_node.inner
                     .entries
                     .iter()
                     .take(pre_node.num_complete_children())
@@ -781,12 +817,16 @@ impl LevelBuilder {
             }
 
             let new_mht_node = Arc::new(MhtNode {
-                header: MhtNodeHeader {
-                    height: self.height,
-                    num_data_nodes: MhtNode::max_num_data_nodes(self.height) as _,
-                    num_valid_entries: MHT_NBRANCHES as _,
+                inner: MhtInner {
+                    header: MhtNodeHeader {
+                        height: self.height,
+                        num_data_nodes: MhtNode::max_num_data_nodes(self.height) as _,
+                        num_valid_entries: MHT_NBRANCHES as _,
+                    },
+                    entries: array_init::array_init(|i| *entries_per_node[i]),
                 },
-                entries: array_init::array_init(|i| *entries_per_node[i]),
+                block_id: 0,
+                parent: None,
             });
             new_mht_nodes.push(new_mht_node);
         }
@@ -808,6 +848,7 @@ impl LevelBuilder {
         let num_valid_entries = entries.len();
 
         let last_mht_node = Arc::new(MhtNode {
+            inner: MhtInner {
             header: MhtNodeHeader {
                 height: self.height,
                 num_data_nodes: num_data_nodes as _,
@@ -821,6 +862,9 @@ impl LevelBuilder {
                     MhtNodeEntry::new_uninit()
                 }
             }),
+        },
+            block_id: 0,
+            parent: None,
         });
         last_mht_node
     }
@@ -856,7 +900,7 @@ impl<'a, L: BlockLog> PreviousBuild<'a, L> {
         }
 
         let mut lookup_node = {
-            let entry = root_node.entries[root_node.num_valid_entries() - 1];
+            let entry = root_node.inner.entries[root_node.num_valid_entries() - 1];
             self.storage
                 .read_mht_node(entry.pos, &entry.key, &entry.mac, &Iv::new_zeroed())
                 .unwrap()
@@ -873,7 +917,7 @@ impl<'a, L: BlockLog> PreviousBuild<'a, L> {
 
             // Incomplete nodes only appear in the last node of each level
             lookup_node = {
-                let entry = lookup_node.entries[lookup_node.num_valid_entries() - 1];
+                let entry = lookup_node.inner.entries[lookup_node.num_valid_entries() - 1];
                 self.storage
                     .read_mht_node(entry.pos, &entry.key, &entry.mac, &Iv::new_zeroed())
                     .unwrap()
@@ -996,7 +1040,7 @@ impl<L: BlockLog> AppendDataBuf<L> {
             .take(end_nth - start_nth)
         {
             let node_buf = search_ctx.node_buf(offset);
-            node_buf.copy_from_slice(&node.0);
+            node_buf.copy_from_slice(&node.inner.0);
             offset += 1;
         }
 
@@ -1057,7 +1101,7 @@ impl<L: BlockLog> Debug for Mht<L> {
 impl Debug for MhtNode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MhtNode")
-            .field("header", &self.header)
+            .field("header", &self.inner.header)
             .finish()
     }
 }
@@ -1065,7 +1109,7 @@ impl Debug for MhtNode {
 impl Debug for DataNode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DataNode")
-            .field("first 16 bytes", &&self.0[..16])
+            .field("first 16 bytes", &&self.inner.0[..16])
             .finish()
     }
 }
@@ -1092,7 +1136,7 @@ impl<'a, L: BlockLog> Debug for MhtDisplayer<'a, L> {
 
         // Display internal MHT nodes hierarchically
         let mut level_entries: Vec<MhtNodeEntry> = root_mht_node
-            .entries
+            .inner.entries
             .into_iter()
             .take(root_mht_node.num_valid_entries())
             .collect();
@@ -1108,7 +1152,7 @@ impl<'a, L: BlockLog> Debug for MhtDisplayer<'a, L> {
                 debug_struct.field("\n node_entry", entry);
                 debug_struct.field("\n -> mht_node", &node);
                 for i in 0..node.num_valid_entries() {
-                    level_entries.push(node.entries[i]);
+                    level_entries.push(node.inner.entries[i]);
                 }
             }
             level_entries.drain(..level_size);

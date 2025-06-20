@@ -64,7 +64,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
         // always store root node at position 0
         let pos = 0;
         let (cipher, mac, iv) = {
-            let plain = node.as_bytes();
+            let plain = node.inner.as_bytes();
             let mut cipher = self.crypt_buf.cipher.borrow_mut();
             let iv = Iv::random();
             let mac = Aead::new().encrypt(&plain, root_key, &iv, &[], cipher.as_mut_slice())?;
@@ -80,7 +80,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
 
     fn update_mht_node(&self, pos: BlockId,node: &Arc<MhtNode>) -> Result<MhtNodeEntry> {
         let (cipher, entry) = {
-            let plain = node.as_bytes();
+            let plain = node.inner.as_bytes();
             let mut cipher = self.crypt_buf.cipher.borrow_mut();
             let iv = Iv::random();
             let key = Key::random();
@@ -108,7 +108,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
         for (i, node) in nodes.iter().enumerate() {
             let cipher = &mut cipher_buf.as_mut_slice()[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE];
             let key = Key::random();
-            let mac = Aead::new().encrypt(&node.0, &key, &Iv::new_zeroed(), &[], cipher)?;
+            let mac = Aead::new().encrypt(&node.inner.0, &key, &Iv::new_zeroed(), &[], cipher)?;
 
             node_entries.push(MhtNodeEntry { pos, key, mac });
             pos += 1;
@@ -122,7 +122,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
         let (entry) = {
             let mut cipher = self.crypt_buf.cipher.borrow_mut();
             let key = Key::random();
-            let mac = Aead::new().encrypt(&node.0, &key, &Iv::new_zeroed(), &[], cipher.as_mut_slice())?;
+            let mac = Aead::new().encrypt(&node.inner.0, &key, &Iv::new_zeroed(), &[], cipher.as_mut_slice())?;
             let pos = self.block_log.append(cipher.as_ref())?;
             (MhtNodeEntry { pos, key, mac })
         };
