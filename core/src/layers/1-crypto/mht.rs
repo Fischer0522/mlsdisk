@@ -1,8 +1,11 @@
+use core::cell::RefCell;
 use std::sync::Arc;
 use super::{Iv, Key, Mac};
-use crate::{layers::{bio::BlockLog, crypto::{crypto_log::{CryptBuf, DataNode, MhtNode, MhtNodeEntry, Pbid, SearchCtx, MHT_NBRANCHES}, NodeCache, RootMhtMeta}}, Aead, Buf};
+use crate::{layers::{bio::BlockLog, crypto::{crypto_log::{CryptBuf, DataInner, DataNode, MhtInner, MhtNode, MhtNodeEntry, Pbid, SearchCtx, ATTACHED_DATA_NODES_COUNT, CHILD_MHT_NODES_COUNT, MHT_NBRANCHES}, NodeCache, RootMhtMeta}}, Aead, Buf, Errno};
 use crate::prelude::*;
+use openssl::{cipher, cipher_ctx::CipherCtxRef};
 use pod::Pod;
+use spin::{mutex::Mutex};
 
 const ENABLED_CACHING: bool = true;
 
@@ -21,18 +24,23 @@ pub trait MHTInterface<L> {
 #[derive(Clone)]
 pub enum Node {
     MhtNode(Arc<MhtNode>),
+    MhtNodeRef(MhtNodeRef),
     DataNode(Arc<DataNode>),
 }
 
+
+pub type MhtNodeRef = Arc<Mutex<MhtNode>>;
+
+
 // In-place MHT
 pub struct IMht<L> {
-    root: Option<(RootMhtMeta, Arc<MhtNode>)>,
+    root: Option<(RootMhtMeta, MhtNodeRef)>,
     root_key: Key,
     storage: Arc<IMhtStorage<L>>,
 }
 
 struct IMhtStorage<L> {
-    root: Option<(RootMhtMeta, Arc<MhtNode>)>,
+    root: Option<(RootMhtMeta, MhtNodeRef)>,
     root_key: Key,
     block_log: L,
     node_cache: Arc<dyn NodeCache>,
@@ -41,7 +49,7 @@ struct IMhtStorage<L> {
 }
 
 impl<L: BlockLog + 'static> IMhtStorage<L> {
-    pub fn new(root: Option<(RootMhtMeta, Arc<MhtNode>)>, root_key: Key, block_log: L, node_cache: Arc<dyn NodeCache>) -> Self {
+    pub fn new(root: Option<(RootMhtMeta, MhtNodeRef)>, root_key: Key, block_log: L, node_cache: Arc<dyn NodeCache>) -> Self {
         Self {
             root: None,
             root_key: Key::random(),
@@ -52,35 +60,48 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
         }
     }
 
+    pub fn total_data_nodes(&self) -> usize {
+        self.logical_offset
+    }
+
     pub fn flush(&self) -> Result<()> {
         self.block_log.flush()
     }
-     pub fn root_mht_node(&self, root_key: &Key, root_meta: &RootMhtMeta) -> Result<Arc<MhtNode>> {
-        todo!()
+     pub fn root_mht_node(&self) -> Result<Arc<MhtNode>> {
+
+        let root_node = self.read_mht_node(0)?;
+        let guard = root_node.lock();
+        let mut copied_root = MhtNode::new_uninit();
+        copied_root.inner = guard.inner.clone();
+        copied_root.logical_number = guard.logical_number;
+        copied_root.physical_number = guard.physical_number;
+
+        Ok(Arc::new(copied_root))
       //zw  self.read_mht_node(root_meta.pos, root_key, &root_meta.mac, &root_meta.iv)
     }
 
-    pub fn append_root_mht_node(&self, root_key: &Key, node: &Arc<MhtNode>) -> Result<RootMhtMeta> {
-        // always store root node at position 0
-        let pos = 0;
-        let (cipher, mac, iv) = {
-            let plain = node.inner.as_bytes();
-            let mut cipher = self.crypt_buf.cipher.borrow_mut();
-            let iv = Iv::random();
-            let mac = Aead::new().encrypt(&plain, root_key, &iv, &[], cipher.as_mut_slice())?;
-            (cipher, mac, iv)
-        };
+    // pub fn append_root_mht_node(&self, root_key: &Key, node: &Arc<MhtNode>) -> Result<RootMhtMeta> {
+    //     // always store root node at position 0
+    //     let pos = 0;
+    //     let (cipher, mac, iv) = {
+    //         let plain = node.inner.as_bytes();
+    //         let mut cipher = self.crypt_buf.cipher.borrow_mut();
+    //         let iv = Iv::random();
+    //         let mac = Aead::new().encrypt(&plain, root_key, &iv, &[], cipher.as_mut_slice())?;
+    //         (cipher, mac, iv)
+    //     };
 
-        self.block_log.update(pos,cipher.as_ref())?;
-        if ENABLED_CACHING {
-            self.node_cache.put(pos, Node::MhtNode(node.clone()));
-        }
-        Ok(RootMhtMeta { pos, mac, iv })
-    }
+    //     self.block_log.update(pos,cipher.as_ref())?;
+    //     if ENABLED_CACHING {
+    //         self.node_cache.put(pos, Node::MhtNode(MhtNodeRef::new(node.clone())));
+    //     }
+    //     Ok(RootMhtMeta { pos, mac, iv })
+    // }
 
-    fn update_mht_node(&self, pos: BlockId,node: &Arc<MhtNode>) -> Result<MhtNodeEntry> {
+    fn update_mht_node(&self, pos: BlockId,node: &MhtNodeRef) -> Result<MhtNodeEntry> {
         let (cipher, entry) = {
-            let plain = node.inner.as_bytes();
+            let node_ref = node.lock();
+            let plain = node_ref.inner.as_bytes();
             let mut cipher = self.crypt_buf.cipher.borrow_mut();
             let iv = Iv::random();
             let key = Key::random();
@@ -90,7 +111,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
 
         self.block_log.update(pos,cipher.as_ref())?;
         if ENABLED_CACHING {
-            self.node_cache.put(pos, Node::MhtNode(node.clone()));
+            self.node_cache.put(pos, Node::MhtNodeRef(node.clone()));
         }
         Ok(entry)
     }
@@ -118,91 +139,184 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
         debug_assert_eq!(start_pos, append_pos);
         Ok(node_entries)
     }
-    fn append_data_node(&self, node: &Arc<DataNode>) -> Result<MhtNodeEntry> {
-        let (entry) = {
+
+    fn append_data_node(&mut self, node: &Arc<DataNode>) -> Result<MhtNodeEntry> {
+
+        let entry = {
             let mut cipher = self.crypt_buf.cipher.borrow_mut();
             let key = Key::random();
             let mac = Aead::new().encrypt(&node.inner.0, &key, &Iv::new_zeroed(), &[], cipher.as_mut_slice())?;
             let pos = self.block_log.append(cipher.as_ref())?;
-            (MhtNodeEntry { pos, key, mac })
+            MhtNodeEntry { pos, key, mac }
         };
+
+        let mht_node = self.get_mht_node(self.logical_offset as u64)?;
+        let new_node = Arc::new(DataNode {
+            inner: node.inner.clone(),
+            block_id: entry.pos,
+            parent: Some(mht_node.clone()),
+        });
+
+        // set the new entry in parent node
+        new_node.update_node_entry(self.logical_offset as u64, entry);
+        self.update_parent_nodes(&new_node)?;
+        self.logical_offset += 1;
         if ENABLED_CACHING {
-            self.node_cache.put(entry.pos, Node::DataNode(node.clone()));
+            self.node_cache.put(entry.pos, Node::DataNode(new_node.clone()));
         }
         Ok(entry)
     }
 
+    fn update_parent_nodes(&mut self, node: &Arc<DataNode>) -> Result<()> {
+        let mut logical_number = self.logical_offset;
+        let mut pos = node.block_id;
+        let mut parent_node = node.parent.clone();
+        while let Some(node) = parent_node.clone() {
+            let new_entry = {
+                let mut cipher = self.crypt_buf.cipher.borrow_mut();
+                let key = Key::random();
+                let mac = Aead::new().encrypt(&node.lock().inner.as_bytes(), &key, &Iv::new_zeroed(), &[], cipher.as_mut_slice())?;
+                MhtNodeEntry { pos, key, mac }
+            };
+
+            //point node to it's parent and get a new parent node
+            let node_ref = node.lock();
+            pos = node_ref.physical_number;
+            node_ref.update_node_entry(logical_number as u64, new_entry);
+            logical_number = node_ref.logical_number;
+            parent_node = node_ref.parent.clone();
+
+            self.update_mht_node(node_ref.physical_number, &node)?;
+
+            // current node is root node
+            if parent_node.is_none() {
+                self.root.as_mut().unwrap().1 = node.clone();
+            }
+        }
+        Ok(())
+    }
 
 
-    fn read_data_node(&self, entry: &MhtNodeEntry, node_buf: &mut [u8]) -> Result<()> {
-        todo!()
+
+    fn read_data_node(&self, logical_number: u64) -> Result<Arc<DataNode>> {
+         let (logic_number, physical_number) = self.get_data_node_numbers(logical_number);
+
+        if let Some(data_node) = self.node_cache.get(physical_number as usize) {
+            if let Node::DataNode(node) = data_node {
+                return Ok(node.clone());
+            } else {
+                return Err(Error::new(Errno::NotFound));
+            }
+        }
+
+        let mht_node = self.get_mht_node(logic_number)?;
+
+        let mut data_node = DataNode::new_uninit();
+        data_node.block_id = physical_number as Pbid;
+        data_node.parent = Some(mht_node);
+
+        let mht_entry = data_node.node_entry(logical_number);
+
+        let Some(mht_entry) = mht_entry else {
+            return Err(Error::new(Errno::NotFound));
+        };
+
+        let mut cipher = self.crypt_buf.cipher.borrow_mut();
+        let mut plain = self.crypt_buf.plain.borrow_mut();
+        self.block_log.read(physical_number as usize, cipher.as_mut())?;
+
+        // decrypt
+        Aead::new().decrypt(
+            cipher.as_slice(),
+            &mht_entry.key,
+            &Iv::new_zeroed(),
+            &[],
+            &mht_entry.mac,
+            plain.as_mut_slice(),
+        )?;
+        data_node.inner = DataInner::from_bytes(plain.as_slice());
+
+        let data_node = Arc::new(data_node);
+        Ok(data_node)
     }
 
     fn get_data_node(&self, entry: &MhtNodeEntry, node_buf: &mut [u8]) -> Result<()> {
         todo!()
     }
 
-    fn append_mht_node(&self, logical_number: u64) -> Result<Arc<MhtNode>> {
+    fn append_mht_node(&self, logical_number: u64) -> Result<MhtNodeRef> {
         let physical_number = logical_number * (MHT_NBRANCHES as u64 + 1);
-        let mht_node = Arc::new(MhtNode::new_uninit());
-        self.node_cache.put(physical_number as usize, Node::MhtNode(mht_node.clone()));
+        let mht_node = Arc::new(Mutex::new(MhtNode::new_uninit()));
+        self.node_cache.put(physical_number as usize, Node::MhtNodeRef(mht_node.clone()));
         Ok(mht_node)
     }
 
-    fn read_mht_node(&self, logical_number: u64) -> Result<Arc<MhtNode>> {
-        if (logical_number == 0) {
+    fn read_mht_node(&self, logical_number: u64) -> Result<MhtNodeRef> {
+        if logical_number == 0 {
             return Ok(self.root.as_ref().unwrap().1.clone());
         }
         let physical_number = logical_number * (MHT_NBRANCHES as u64 + 1);
-        if let Some(Node::MhtNode(node)) = self.node_cache.get(physical_number as usize) {
-            return Ok(node);
+        if let Some(Node::MhtNodeRef(node)) = self.node_cache.get(physical_number as usize) {
+            return Ok(node.clone());
         }
 
-        // iter from root to target node
-        let mut parent_node = self.root.as_ref().unwrap().1.clone();
+        let parent_mht_node = self.read_mht_node((logical_number - 1) / CHILD_MHT_NODES_COUNT as u64)?;
+        let mut mht_node = MhtNode::new_uninit();
+        mht_node.parent = Some(parent_mht_node.clone());
+        mht_node.logical_number = logical_number as usize;
+        mht_node.physical_number = physical_number as usize;
 
-        for i in 1..logical_number {
-            let physical_number = i * (MHT_NBRANCHES as u64 + 1);
-            if let Some(Node::MhtNode(node)) = self.node_cache.get(physical_number as usize) {
-                parent_node = node;
-            } else {
-                let mut cipher = self.crypt_buf.cipher.borrow_mut();
-                let mut plain = self.crypt_buf.plain.borrow_mut();
-                let current_node = self.block_log.read(physical_number as usize, cipher.as_mut())?;
+        let mut cipher = self.crypt_buf.cipher.borrow_mut();
+        let mut plain = self.crypt_buf.plain.borrow_mut();
+        self.block_log.read(physical_number as usize, cipher.as_mut())?;
+        let entry = parent_mht_node.lock().node_entry(logical_number).unwrap();
 
-            }
-        }
-        todo!()
-        //info!("miss cache for MHT node at pos {}", pos);
-        // let mht_node = {
-        //     let mut cipher = self.crypt_buf.cipher.borrow_mut();
-        //     let mut plain = self.crypt_buf.plain.borrow_mut();
-        //     self.block_log.read(pos, cipher.as_mut())?;
-        //     Aead::new().decrypt(cipher.as_slice(), key, iv, &[], mac, plain.as_mut_slice())?;
-        //     Arc::new(MhtNode::from_bytes(plain.as_slice()))
-        // };
+        // decrypt
 
-        // if ENABLED_CACHING {
-        //     self.node_cache.put(pos, Node::MhtNode(mht_node.clone()));
-        // }
+        Aead::new().decrypt(
+            cipher.as_slice(),
+            &entry.key,
+            &Iv::new_zeroed(),
+            &[],
+            &entry.mac,
+            plain.as_mut_slice(),
+        )?;
+
+        mht_node.inner = MhtInner::from_bytes(plain.as_slice());
+        let mht_node = Arc::new(Mutex::new(mht_node));
+        self.node_cache.put(physical_number as usize, Node::MhtNodeRef(mht_node.clone()));
+        Ok(mht_node)
     }
 
 
-    fn get_mht_node(&self, logical_number: u64) -> Result<Arc<MhtNode>> {
-        let mut parent_node = None;
-        for i in 0..logical_number {
-            let physical_number = logical_number * (MHT_NBRANCHES as u64 + 1);
-            // root node
-            if let Some(Node::MhtNode(parent)) = self.node_cache.get(physical_number as usize) {
-                parent_node = Some(parent);
-            } else {
-
-            }
+    fn get_mht_node(&self, logical_offset: u64) -> Result<MhtNodeRef> {
+        let (logic_number, _) = self.get_mht_node_numbers(logical_offset);
+        if logic_number == 0 {
+            return Ok(self.root.as_ref().unwrap().1.clone());
         }
-        todo!()
+
+        if (self.logical_offset) % (ATTACHED_DATA_NODES_COUNT as usize * BLOCK_SIZE)
+            == 0
+        {
+            self.append_mht_node(logic_number)
+        } else {
+            self.read_mht_node(logic_number)
+        }
     }
 
-    fn get_node_numbers(&self) -> (u64, u64, u64, u64) {
+    #[inline]
+    pub fn get_data_node_numbers(&self, logical_offset: u64) -> (u64, u64) {
+        let (_, logic, _, physical) = self.get_node_numbers(logical_offset);
+        (logic, physical)
+    }
+
+    #[inline]
+    fn get_mht_node_numbers(&self, logical_offset: u64) -> (u64, u64) {
+        let (logic, _, physical, _) = self.get_node_numbers(logical_offset);
+        (logic, physical)
+    }
+
+    fn get_node_numbers(&self, logical_offset: u64) -> (u64, u64, u64, u64) {
     if self.logical_offset < 1 {
         return (0, 0, 0, 0);
     }
@@ -212,7 +326,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
     // node 103 - mht
     // node 104-205 - data
     // etc.
-    let data_logic_number = self.logical_offset  as u64;
+    let data_logic_number = logical_offset;
     let mht_logic_number = data_logic_number / MHT_NBRANCHES as u64;
 
     // + 1 - mht root
@@ -253,7 +367,7 @@ impl<L: BlockLog + 'static> IMht<L> {
     }
 }
 
-impl <L: BlockLog> MHTInterface<L> for IMht<L> {
+impl <L: BlockLog + 'static> MHTInterface<L> for IMht<L> {
     fn root_key(&self) -> Key {
         self.root_key
     }
@@ -267,23 +381,38 @@ impl <L: BlockLog> MHTInterface<L> for IMht<L> {
     }
 
     fn total_data_nodes(&self) -> usize {
-        todo!()
+        self.storage.total_data_nodes().clone()
     }
 
     fn search(&self, search_ctx: &mut SearchCtx<'_>) -> Result<()> {
-        todo!()
+        for offset in 0..search_ctx.num {
+            let logical_number = search_ctx.pos + offset;
+            let data_node = self.storage.read_data_node(logical_number as u64)?;
+            search_ctx.node_buf(offset).copy_from_slice(&data_node.inner.0);
+        }
+        search_ctx.is_completed = true;
+        Ok(())
     }
 
     fn append_data_nodes(&mut self, data_nodes: Vec<Arc<DataNode>>) -> Result<()> {
-        todo!()
+        if data_nodes.is_empty() {
+            return Ok(());
+        }
+
+        self.storage.append_data_nodes(&data_nodes)?;
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
-        todo!()
+        self.storage.flush()
     }
 
     fn display(&self) {
-        todo!()
+        if let Some((root_meta, root_node)) = &self.root {
+            println!("Root MHT Meta: {:?}", root_meta);
+        } else {
+            println!("No root MHT node available.");
+        }
     }
 }
 
