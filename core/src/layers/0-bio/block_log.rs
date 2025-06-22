@@ -70,6 +70,7 @@ impl BlockLog for MemLog {
     fn update(&self, offset: BlockId, buf: BufRef) -> Result<()> {
         let nblocks = buf.nblocks();
         if offset + nblocks > self.nblocks() {
+            error!("update range out of bound: offset {}, nblocks {}, total {}", offset, nblocks, self.nblocks());
             return_errno_with_msg!(InvalidArgs, "update range out of bound");
         }
         let mut log = self.log.lock();
