@@ -218,7 +218,7 @@ impl DataNode {
     }
 
     pub fn node_entry(&self,logical_number: u64) -> Option<MhtNodeEntry> {
-        if logical_number == 0 {
+        if logical_number == 0  && self.block_id == 0{
             return None;
         }
         let Some(parent) = self.parent.clone() else {
@@ -233,7 +233,7 @@ impl DataNode {
     }
 
     pub fn update_node_entry(&self, logical_number: u64, entry: MhtNodeEntry) {
-        if logical_number == 0 {
+        if logical_number == 0 && self.block_id == 0 {
             return;
         }
         let Some(parent) = self.parent.clone() else {
