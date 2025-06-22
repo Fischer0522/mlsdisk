@@ -157,14 +157,14 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
             MhtNodeEntry { pos, key, mac }
         };
 
-        let mht_node = self.get_mht_node(self.logical_offset as u64)?;
+        let mht_node = self.get_mht_node(self.logical_offset as u64, self.logical_offset as u64)?;
         let new_node = Arc::new(DataNode {
             inner: node.inner.clone(),
             logical_number: logic_number as usize,
             physical_number: entry.pos,
             parent: Some(mht_node.clone()),
         });
-        info!("Appending data node at logical offset: {}, physical position: {}, parent is {}", self.logical_offset, entry.pos, mht_node.lock().logical_number);
+       // info!("Appending data node at logical offset: {}, physical position: {}, parent is {}", self.logical_offset, entry.pos, mht_node.lock().logical_number);
 
         // set the new entry in parent node
 
@@ -224,7 +224,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
             }
         }
 
-        let mht_node = self.get_mht_node(logic_number)?;
+        let mht_node = self.get_mht_node(logic_number, logic_number)?;
 
         let mut data_node = DataNode::new_uninit();
         data_node.physical_number = physical_number as Pbid;
@@ -248,7 +248,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
             &[],
             &mht_entry.mac,
             plain.as_mut_slice(),
-        )?;
+        ).unwrap();
         data_node.inner = DataInner::from_bytes(plain.as_slice());
 
         let data_node = Arc::new(data_node);
@@ -291,7 +291,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
         let mut cipher = self.crypt_buf.cipher.borrow_mut();
         let mut plain = self.crypt_buf.plain.borrow_mut();
         self.block_log.read(physical_number as usize, cipher.as_mut())?;
-        info!("Reading MHT node at logical number: {}, physical number: {}", logical_number, physical_number);
+        // info!("Reading MHT node at logical number: {}, physical number: {}", logical_number, physical_number);
         let entry = mht_node.node_entry(logical_number).unwrap();
 
         // decrypt
@@ -312,14 +312,14 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
     }
 
 
-    fn get_mht_node(&self, logical_offset: u64) -> Result<MhtNodeRef> {
+    fn get_mht_node(&self, logical_offset: u64, data_offset: u64) -> Result<MhtNodeRef> {
         let (logic_number, _) = self.get_mht_node_numbers(logical_offset);
         if logic_number == 0 {
             return Ok(self.root.as_ref().unwrap().1.clone());
         }
 
         if logical_offset % ATTACHED_DATA_NODES_COUNT as u64
-            == 0
+            == 0 && data_offset == self.logical_offset as u64
         {
             self.append_mht_node(logic_number)
         } else {
@@ -405,6 +405,7 @@ impl <L: BlockLog + 'static> MHTInterface<L> for IMht<L> {
 
     fn search(&self, search_ctx: &mut SearchCtx<'_>) -> Result<()> {
         for offset in 0..search_ctx.num {
+            info!("Searching for node {}", offset);
             let logical_number = search_ctx.pos + offset;
             let data_node = self.storage.read_data_node(logical_number as u64)?;
             search_ctx.node_buf(offset).copy_from_slice(&data_node.inner.0);
@@ -574,7 +575,7 @@ fn init_logger() {
     }
 
 
-    #[test]
+#[test]
 fn imht_search() {
     init_logger();
     let mut imht = mht_create().unwrap();
@@ -591,13 +592,22 @@ fn imht_search() {
     imht.append_data_nodes(data_nodes).unwrap();
     assert_eq!(imht.storage.total_data_nodes(), 1000);
 
-    let mut buf = Buf::alloc(10).unwrap();
-    let mut search_ctx = SearchCtx::new(0, buf.as_mut());
+    // let mut buf = Buf::alloc(10).unwrap();
+    // let mut search_ctx = SearchCtx::new(0, buf.as_mut());
+    // imht.search(&mut search_ctx).unwrap();
+    // assert!(search_ctx.is_completed);
+    // for i in 0..10 {
+    //     assert_eq!(search_ctx.node_buf(i), &[i as u8; BLOCK_SIZE]);
+    // }
+
+    let mut buf = Buf::alloc(100).unwrap();
+    let mut search_ctx = SearchCtx::new(60, buf.as_mut());
     imht.search(&mut search_ctx).unwrap();
     assert!(search_ctx.is_completed);
-    for i in 0..10 {
-        assert_eq!(search_ctx.node_buf(i), &[i as u8; BLOCK_SIZE]);
+    for i in 0..100 {
+        assert_eq!(search_ctx.node_buf(i), &[60 + i as u8; BLOCK_SIZE]);
     }
+
 }
 
     // Add more tests for append, search, flush, etc.
