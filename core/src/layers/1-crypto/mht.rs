@@ -1,7 +1,7 @@
 use core::cell::RefCell;
 use std::sync::Arc;
 use super::{Iv, Key, Mac};
-use crate::{layers::{bio::BlockLog, crypto::{crypto_log::{CryptBuf, DataInner, DataNode, MhtInner, MhtNode, MhtNodeEntry, Pbid, SearchCtx, ATTACHED_DATA_NODES_COUNT, CHILD_MHT_NODES_COUNT, MHT_NBRANCHES}, NodeCache, RootMhtMeta}}, Aead, Buf, Errno};
+use crate::{layers::{bio::BlockLog, crypto::{crypto_log::{CryptBuf, DataInner, DataNode, MhtInner, MhtNode, MhtNodeEntry, Pbid, SearchCtx, ATTACHED_DATA_NODES_COUNT, CHILD_MHT_NODES_COUNT, MHT_NBRANCHES}, NodeCache, RootMhtMeta}, lsm::SSTABLE_CAPACITY}, Aead, Buf, Errno};
 use crate::prelude::*;
 use openssl::{cipher, cipher_ctx::CipherCtxRef};
 use pod::Pod;
@@ -52,8 +52,9 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
     pub fn new(root_key: Key, block_log: L, node_cache: Arc<dyn NodeCache>) -> Self {
         // reserve one block for the root node
         let block_log = block_log;
-        let buf = Buf::alloc(1).unwrap();
-
+        let reserved_capacity = (SSTABLE_CAPACITY as f64 * 1.5) as u64;
+        let buf = Buf::alloc(reserved_capacity as usize).unwrap();
+        block_log.append(buf.as_ref()).unwrap();
 
         let root_mht = MhtNode::new_uninit();
         let root_mht_meta = RootMhtMeta {
@@ -63,7 +64,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
         };
         let root_mht_ref = Arc::new(Mutex::new(root_mht));
         let root = Some((root_mht_meta, root_mht_ref));
-        block_log.append(buf.as_ref()).unwrap(); // ensure the log is initialized with at least one block
+
         Self {
             root: root,
             root_key: root_key,
@@ -123,7 +124,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
             (cipher, MhtNodeEntry { pos, key, mac })
         };
 
-        self.block_log.update(pos,cipher.as_ref())?;
+        self.block_log.write(pos,cipher.as_ref())?;
         if ENABLED_CACHING {
             self.node_cache.put(pos, Node::MhtNodeRef(node.clone()));
         }
@@ -145,19 +146,22 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
     }
 
     fn append_data_node(&mut self, node: &Arc<DataNode>) -> Result<MhtNodeEntry> {
+        let (logic_number, physical_number) = self.get_data_node_numbers(self.logical_offset as u64);
 
         let entry = {
             let mut cipher = self.crypt_buf.cipher.borrow_mut();
             let key = Key::random();
             let mac = Aead::new().encrypt(&node.inner.0, &key, &Iv::new_zeroed(), &[], cipher.as_mut_slice())?;
-            let pos = self.block_log.append(cipher.as_ref())?;
+            let pos = physical_number as Pbid;
+            self.block_log.write(physical_number as usize,cipher.as_ref())?;
             MhtNodeEntry { pos, key, mac }
         };
 
         let mht_node = self.get_mht_node(self.logical_offset as u64)?;
         let new_node = Arc::new(DataNode {
             inner: node.inner.clone(),
-            block_id: entry.pos,
+            logical_number: logic_number as usize,
+            physical_number: entry.pos,
             parent: Some(mht_node.clone()),
         });
         println!("Appending data node at logical offset: {}, physical position: {}, parent is {}", self.logical_offset, entry.pos, mht_node.lock().logical_number);
@@ -174,7 +178,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
 
     fn update_parent_nodes(&mut self, node: &Arc<DataNode>) -> Result<()> {
         let mut logical_number = self.logical_offset;
-        let mut pos = node.block_id;
+        let mut pos = node.physical_number;
         let mut parent_node = node.parent.clone();
         while let Some(node) = parent_node.clone() {
             let new_entry = {
@@ -225,7 +229,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
         let mht_node = self.get_mht_node(logic_number)?;
 
         let mut data_node = DataNode::new_uninit();
-        data_node.block_id = physical_number as Pbid;
+        data_node.physical_number = physical_number as Pbid;
         data_node.parent = Some(mht_node);
 
         let mht_entry = data_node.node_entry(logical_number);
@@ -338,10 +342,6 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
     }
 
     fn get_node_numbers(&self, logical_offset: u64) -> (u64, u64, u64, u64) {
-    if self.logical_offset < 1 {
-        return (0, 0, 0, 0);
-    }
-
     // node 0 - mht
     // nodes 1-102 - data (MHT_NBRANCHES == 102)
     // node 103 - mht
@@ -502,7 +502,7 @@ fn init_logger() {
     }
 
     fn mht_create() -> Result<IMht<MemLog>> {
-        let block_log = MemLog::create(10240)?;
+        let block_log = MemLog::create(SSTABLE_CAPACITY * 2)?;
         let node_cache = Arc::new(NoCache {});
         let root_key = Key::random();
         let imht = IMht::<MemLog>::new(block_log, root_key, node_cache);
@@ -524,7 +524,8 @@ fn init_logger() {
             .map(|i| {
                 Arc::new(DataNode {
                     inner: DataInner::from_bytes(&[i as u8; BLOCK_SIZE]),
-                    block_id: 0,
+                    logical_number: i as usize,
+                    physical_number: 0,
                     parent: None,
                 })
             })
@@ -549,7 +550,8 @@ fn init_logger() {
             .map(|i| {
                 Arc::new(DataNode {
                     inner: DataInner::from_bytes(&[i as u8; BLOCK_SIZE]),
-                    block_id: 0,
+                    logical_number: i as usize,
+                    physical_number: 0,
                     parent: None,
                 })
             })
@@ -562,7 +564,8 @@ fn init_logger() {
             .map(|i| {
                 Arc::new(DataNode {
                     inner: DataInner::from_bytes(&[i as u8; BLOCK_SIZE]),
-                    block_id: 0,
+                    logical_number: i as usize,
+                    physical_number: 0,
                     parent: None,
                 })
             })

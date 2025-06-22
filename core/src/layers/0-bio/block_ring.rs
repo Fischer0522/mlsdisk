@@ -76,7 +76,7 @@ impl<S: BlockSet> BlockLog for BlockRing<S> {
         Ok(cursor)
     }
 
-    fn update(&self, offset: BlockId, buf: BufRef) -> Result<()> {
+    fn write(&self, offset: BlockId, buf: BufRef) -> Result<()> {
         unimplemented!("update is not implemented for BlockRing")
     }
 

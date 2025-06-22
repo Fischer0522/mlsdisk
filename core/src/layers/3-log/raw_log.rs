@@ -401,9 +401,9 @@ impl<D: BlockSet> BlockLog for RawLog<D> {
         Ok(pos)
     }
 
-    fn update(&self, offset: BlockId, buf: BufRef) -> Result<()> {
+    fn write(&self, offset: BlockId, buf: BufRef) -> Result<()> {
         let mut log_ref = self.as_ref();
-        log_ref.update(offset, buf)
+        log_ref.write(offset, buf)
     }
 
     /// Ensures that blocks are persisted to the disk.
@@ -543,7 +543,7 @@ impl<'a, D: BlockSet> RawLogRef<'a, D> {
         Ok(())
     }
 
-    pub fn update(&mut self, mut offset: BlockId, buf: BufRef) -> Result<()> {
+    pub fn write(&mut self, mut offset: BlockId, buf: BufRef) -> Result<()> {
         let mut nblocks = buf.nblocks();
         let head_len = self.head_len();
         let tail_len = self.tail_len();
@@ -1227,7 +1227,7 @@ mod tests {
             let log = raw_log_store.open_log(log_id, true)?;
             let mut buf = Buf::alloc(1)?;
             buf.as_mut_slice().fill(3u8);
-            log.update(1, buf.as_ref())?;
+            log.write(1, buf.as_ref())?;
             Ok(())
         });
         res?;

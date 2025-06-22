@@ -204,7 +204,8 @@ pub const CHILD_MHT_NODES_COUNT: usize = MHT_NBRANCHES - ATTACHED_DATA_NODES_COU
 
 pub struct DataNode {
     pub inner: DataInner,
-    pub block_id: Pbid,
+    pub logical_number: Pbid, // Logical number in the MHT
+    pub physical_number: Pbid,
     pub parent: Option<MhtNodeRef>,
 }
 
@@ -212,13 +213,14 @@ impl DataNode {
     pub fn new_uninit() -> Self {
         Self {
             inner: DataInner::new_uninit(),
-            block_id: 0,
+            logical_number: 0,
+            physical_number: 0,
             parent: None,
         }
     }
 
     pub fn node_entry(&self,logical_number: u64) -> Option<MhtNodeEntry> {
-        if logical_number == 0  && self.block_id == 0{
+        if logical_number == 0  && self.physical_number == 0{
             return None;
         }
         let Some(parent) = self.parent.clone() else {
@@ -233,7 +235,7 @@ impl DataNode {
     }
 
     pub fn update_node_entry(&self, logical_number: u64, entry: MhtNodeEntry) {
-        if logical_number == 0 && self.block_id == 0 {
+        if logical_number == 0 && self.physical_number == 0 {
             return;
         }
         let Some(parent) = self.parent.clone() else {
