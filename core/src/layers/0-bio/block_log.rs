@@ -4,6 +4,7 @@ use crate::prelude::*;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 use inherit_methods_macro::inherit_methods;
+use serde::de;
 
 /// A log of data blocks that can support random reads and append-only
 /// writes.
@@ -50,9 +51,10 @@ impl_blocklog_for!(Box<T>, "(**self)");
 impl_blocklog_for!(Arc<T>, "(**self)");
 
 /// An in-memory log that impls `BlockLog`.
+#[derive(Clone)]
 pub struct MemLog {
-    log: Mutex<Buf>,
-    append_pos: AtomicUsize,
+    log: Arc<Mutex<Buf>>,
+    append_pos: Arc<AtomicUsize>,
 }
 
 impl BlockLog for MemLog {
@@ -75,8 +77,8 @@ impl BlockLog for MemLog {
             self.append(buf.as_ref())?;
         }
         let mut log = self.log.lock();
-        let write_buf =
-            &mut log.as_mut_slice()[Self::offset(offset)..Self::offset(offset) + nblocks * BLOCK_SIZE];
+        let write_buf = &mut log.as_mut_slice()
+            [Self::offset(offset)..Self::offset(offset) + nblocks * BLOCK_SIZE];
         write_buf.copy_from_slice(buf.as_slice());
         Ok(())
     }
@@ -107,8 +109,8 @@ impl BlockLog for MemLog {
 impl MemLog {
     pub fn create(num_blocks: usize) -> Result<Self> {
         Ok(Self {
-            log: Mutex::new(Buf::alloc(num_blocks)?),
-            append_pos: AtomicUsize::new(0),
+            log: Arc::new(Mutex::new(Buf::alloc(num_blocks)?)),
+            append_pos: Arc::new(AtomicUsize::new(0)),
         })
     }
 

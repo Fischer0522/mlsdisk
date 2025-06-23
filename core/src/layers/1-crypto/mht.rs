@@ -185,7 +185,11 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
             let plain = node_ref.inner.as_bytes();
             let mut cipher = self.crypt_buf.cipher.borrow_mut();
             let iv = Iv::new_zeroed();
-            let key = Key::random();
+            let key = if pos == 0 {
+                self.root_key.clone()
+            } else {
+                Key::random()
+            };
             let mac = Aead::new().encrypt(&plain, &key, &iv, &[], cipher.as_mut_slice())?;
             (cipher, MhtNodeEntry { pos, key, mac })
         };
@@ -495,7 +499,6 @@ impl<L: BlockLog + 'static> MHTInterface<L> for IMht<L> {
 
     fn search(&self, search_ctx: &mut SearchCtx<'_>) -> Result<()> {
         for offset in 0..search_ctx.num {
-            info!("Searching for node {}", offset);
             let logical_number = search_ctx.pos + offset;
             let data_node = self.storage.read_data_node(logical_number as u64)?;
             search_ctx
@@ -582,18 +585,19 @@ mod tests {
         }
     }
 
-    fn mht_create() -> Result<IMht<MemLog>> {
-        let block_log = MemLog::create(SSTABLE_CAPACITY * 2)?;
+    fn mht_create() -> Result<(MemLog, IMht<MemLog>)> {
+        let block_log = MemLog::create(30000)?;
+        let copyed_block_log = block_log.clone();
         let node_cache = Arc::new(NoCache {});
         let root_key = Key::random();
         let imht = IMht::<MemLog>::new(block_log, root_key, node_cache);
         info!("Created IMHT successfully");
-        Ok(imht)
+        Ok((copyed_block_log, imht))
     }
 
     #[test]
     fn imht_create() {
-        let imht = mht_create().unwrap();
+        let (_, imht) = mht_create().unwrap();
         assert!(imht.root.is_none());
         assert_eq!(imht.storage.total_data_nodes(), 0);
         imht.display();
@@ -601,7 +605,7 @@ mod tests {
 
     #[test]
     fn imht_append_data_nodes() {
-        let mut imht = mht_create().unwrap();
+        let (_, mut imht) = mht_create().unwrap();
         let data_nodes: Vec<Arc<DataNode>> = (0..10)
             .map(|i| {
                 Arc::new(DataNode {
@@ -627,7 +631,7 @@ mod tests {
     #[test]
     fn imht_multi_append() {
         init_logger();
-        let mut imht = mht_create().unwrap();
+        let (_, mut imht) = mht_create().unwrap();
         let data_nodes: Vec<Arc<DataNode>> = (0..1000)
             .map(|i| {
                 Arc::new(DataNode {
@@ -659,7 +663,7 @@ mod tests {
     #[test]
     fn imht_search() {
         init_logger();
-        let mut imht = mht_create().unwrap();
+        let (_, mut imht) = mht_create().unwrap();
         let data_nodes: Vec<Arc<DataNode>> = (0..1000)
             .map(|i| {
                 Arc::new(DataNode {
@@ -672,15 +676,6 @@ mod tests {
             .collect();
         imht.append_data_nodes(data_nodes).unwrap();
         assert_eq!(imht.storage.total_data_nodes(), 1000);
-
-        // let mut buf = Buf::alloc(10).unwrap();
-        // let mut search_ctx = SearchCtx::new(0, buf.as_mut());
-        // imht.search(&mut search_ctx).unwrap();
-        // assert!(search_ctx.is_completed);
-        // for i in 0..10 {
-        //     assert_eq!(search_ctx.node_buf(i), &[i as u8; BLOCK_SIZE]);
-        // }
-
         let mut buf = Buf::alloc(100).unwrap();
         let mut search_ctx = SearchCtx::new(60, buf.as_mut());
         imht.search(&mut search_ctx).unwrap();
@@ -691,7 +686,44 @@ mod tests {
     }
 
     #[test]
-    fn imht_open() {}
+    fn imht_open() {
+        init_logger();
+        let (mem_log, mut imht) = mht_create().unwrap();
+        let data_nodes: Vec<Arc<DataNode>> = (0..1000)
+            .map(|i| {
+                Arc::new(DataNode {
+                    inner: DataInner::from_bytes(&[i as u8; BLOCK_SIZE]),
+                    logical_number: i as usize,
+                    physical_number: 0,
+                    parent: None,
+                })
+            })
+            .collect();
+        imht.append_data_nodes(data_nodes).unwrap();
+        assert_eq!(imht.storage.total_data_nodes(), 1000);
+        let mut buf = Buf::alloc(100).unwrap();
+        let mut search_ctx = SearchCtx::new(60, buf.as_mut());
+        imht.search(&mut search_ctx).unwrap();
+        assert!(search_ctx.is_completed);
+        for i in 0..100 {
+            assert_eq!(search_ctx.node_buf(i), &[60 + i as u8; BLOCK_SIZE]);
+        }
+        imht.flush().unwrap();
+
+        let root_meta = imht.root_meta().unwrap();
+        let root_key = imht.root_key();
+        drop(imht); // Drop the original IMHT
+        let node_cache = Arc::new(NoCache {});
+        let imht = IMht::open(mem_log, root_key, root_meta, node_cache).unwrap();
+
+        let mut buf = Buf::alloc(100).unwrap();
+        let mut search_ctx = SearchCtx::new(60, buf.as_mut());
+        imht.search(&mut search_ctx).unwrap();
+        assert!(search_ctx.is_completed);
+        for i in 0..100 {
+            assert_eq!(search_ctx.node_buf(i), &[60 + i as u8; BLOCK_SIZE]);
+        }
+    }
 
     // Add more tests for append, search, flush, etc.
 }
