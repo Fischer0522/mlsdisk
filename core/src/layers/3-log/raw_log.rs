@@ -577,7 +577,7 @@ impl<'a, D: BlockSet> RawLogRef<'a, D> {
             && offset >= head_len
         {
             let num_update = nblocks.min(total_len - offset);
-            let update_buf = BufRef::try_from(&buf.as_slice()[(offset - head_len) * BLOCK_SIZE..(offset - head_len + num_update) * BLOCK_SIZE])?;
+            let update_buf = BufRef::try_from(&buf.as_slice()[..num_update * BLOCK_SIZE])?;
 
             tail.update(offset - head_len, update_buf, &disk)?;
         }

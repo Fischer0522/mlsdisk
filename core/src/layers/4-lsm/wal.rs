@@ -221,8 +221,10 @@ impl<D: BlockSet + 'static> WalTxInner<D> {
             let log_id_opt = self.log_id.clone();
             let res = wal_tx.context(|| {
                 if log_id_opt.is_some() {
+                    info!("Opening existing WAL log: {:?}", log_id_opt);
                     store.open_log(log_id_opt.unwrap(), true)
                 } else {
+                    info!("Creating new WAL log");
                     store.create_log(BUCKET_WAL)
                 }
             });

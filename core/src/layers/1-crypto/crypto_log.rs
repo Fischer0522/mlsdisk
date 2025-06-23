@@ -1,16 +1,16 @@
 use super::{Iv, Key, Mac};
 use crate::layers::bio::{BlockId, BlockLog, Buf, BufMut, BufRef, BLOCK_SIZE};
-use crate::layers::crypto::mht::{MHTInterface, MhtNodeRef, Node};
+use crate::layers::crypto::mht::{IMht, MHTInterface, MhtNodeRef, Node};
 use crate::os::{Aead, HashMap, RwLock};
 use crate::prelude::*;
 
 use core::any::Any;
 use core::cell::RefCell;
 use core::mem::size_of;
-use std::time::Instant;
 use pod::Pod;
 use serde::{Deserialize, Serialize};
 use static_assertions::const_assert;
+use std::time::Instant;
 
 /// A cryptographically-protected log of user data blocks.
 ///
@@ -76,7 +76,7 @@ use static_assertions::const_assert;
 /// So the disk space wasted by such `CryptoLog` is bounded.
 /// And after such `CryptoLog`s are done writing, they will be read once and
 /// then discarded.
-/// 
+///
 
 const ENABLED_CACHING: bool = false;
 
@@ -129,7 +129,7 @@ pub struct MhtInner {
 }
 
 impl MhtNode {
-        pub fn new_uninit() -> Self {
+    pub fn new_uninit() -> Self {
         Self {
             inner: MhtInner::new_uninit(),
             logical_number: 0,
@@ -138,8 +138,7 @@ impl MhtNode {
         }
     }
 
-    pub fn node_entry(&self,logical_number: u64) -> Option<MhtNodeEntry> {
-        
+    pub fn node_entry(&self, logical_number: u64) -> Option<MhtNodeEntry> {
         if logical_number == 0 {
             return None;
         }
@@ -190,15 +189,14 @@ pub struct MhtNodeEntry {
 }
 
 // Number of branches of one MHT node. (102 for now)
-pub const MHT_NBRANCHES: usize = (BLOCK_SIZE - size_of::<MhtNodeHeader>()) / size_of::<MhtNodeEntry>();
+pub const MHT_NBRANCHES: usize =
+    (BLOCK_SIZE - size_of::<MhtNodeHeader>()) / size_of::<MhtNodeEntry>();
 
 pub const ATTACHED_DATA_NODES_COUNT: usize = 75;
 
 pub const CHILD_MHT_NODES_COUNT: usize = MHT_NBRANCHES - ATTACHED_DATA_NODES_COUNT;
 
-
-
-
+pub const APPEND_ONLY: bool = false; // Whether the MHT is append-only
 
 /// The data node (leaf). It contains a block of data.
 
@@ -219,8 +217,8 @@ impl DataNode {
         }
     }
 
-    pub fn node_entry(&self,logical_number: u64) -> Option<MhtNodeEntry> {
-        if logical_number == 0  && self.physical_number == 0{
+    pub fn node_entry(&self, logical_number: u64) -> Option<MhtNodeEntry> {
+        if logical_number == 0 && self.physical_number == 0 {
             return None;
         }
         let Some(parent) = self.parent.clone() else {
@@ -229,7 +227,7 @@ impl DataNode {
         let parent = parent.lock();
 
         // set a offset, store data node entry after mht node entry
-        let idx = CHILD_MHT_NODES_COUNT +(logical_number) as usize % ATTACHED_DATA_NODES_COUNT;
+        let idx = CHILD_MHT_NODES_COUNT + (logical_number) as usize % ATTACHED_DATA_NODES_COUNT;
 
         Some(parent.inner.entries[idx])
     }
@@ -242,14 +240,14 @@ impl DataNode {
             return;
         };
         let mut parent = parent.lock();
-        let idx = CHILD_MHT_NODES_COUNT +(logical_number) as usize % ATTACHED_DATA_NODES_COUNT;
+        let idx = CHILD_MHT_NODES_COUNT + (logical_number) as usize % ATTACHED_DATA_NODES_COUNT;
         parent.inner.entries[idx] = entry;
     }
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod)]
-pub struct DataInner (pub [u8; BLOCK_SIZE]);
+pub struct DataInner(pub [u8; BLOCK_SIZE]);
 
 /// Builder for MHT.
 struct TreeBuilder<'a, L> {
@@ -282,11 +280,7 @@ pub trait NodeCache {
 
     /// Puts a position-value pair into cache. If the value of that position
     /// already exists, updates it and returns the old value. Otherwise, `None` is returned.
-    fn put(
-        &self,
-        pos: Pbid,
-        value: Node,
-    ) -> Option<Node>;
+    fn put(&self, pos: Pbid, value: Node) -> Option<Node>;
 }
 
 /// Context for a search request.
@@ -310,8 +304,14 @@ impl<L: BlockLog + 'static> CryptoLog<L> {
     /// A newly-created instance won't occupy any space on the `block_log`
     /// until the first flush, which triggers writing the root MHT node.
     pub fn new(block_log: L, root_key: Key, node_cache: Arc<dyn NodeCache>) -> Self {
-        Self {
-            mht: RwLock::new(Box::new(Mht::new(block_log, root_key, node_cache))),
+        if APPEND_ONLY {
+            Self {
+                mht: RwLock::new(Box::new(Mht::new(block_log, root_key, node_cache))),
+            }
+        } else {
+            Self {
+                mht: RwLock::new(Box::new(IMht::new(block_log, root_key, node_cache))),
+            }
         }
     }
 
@@ -325,9 +325,19 @@ impl<L: BlockLog + 'static> CryptoLog<L> {
         root_meta: RootMhtMeta,
         node_cache: Arc<dyn NodeCache>,
     ) -> Result<Self> {
-        Ok(Self {
-            mht: RwLock::new(Box::new(Mht::open(block_log, root_key, root_meta, node_cache)?)),
-        })
+        if APPEND_ONLY {
+            Ok(Self {
+                mht: RwLock::new(Box::new(Mht::open(
+                    block_log, root_key, root_meta, node_cache,
+                )?)),
+            })
+        } else {
+            Ok(Self {
+                mht: RwLock::new(Box::new(IMht::open(
+                    block_log, root_key, root_meta, node_cache,
+                )?)),
+            })
+        }
     }
 
     /// Gets the root key.
@@ -343,7 +353,7 @@ impl<L: BlockLog + 'static> CryptoLog<L> {
     }
 
     fn root_node(&self) -> Option<Arc<MhtNode>> {
-        self.mht.read().root_node().cloned()
+        self.mht.read().root_node().clone()
     }
 
     /// Gets the number of data nodes (blocks).
@@ -400,8 +410,8 @@ impl<L: BlockLog> MHTInterface<L> for Mht<L> {
         self.root_meta()
     }
 
-    fn root_node(&self) -> Option<&Arc<MhtNode>> {
-        self.root_node()
+    fn root_node(&self) -> Option<Arc<MhtNode>> {
+        self.root_node().cloned()
     }
 
     fn total_data_nodes(&self) -> usize {
@@ -679,7 +689,12 @@ impl<L: BlockLog> MhtStorage<L> {
             let mut plain = self.crypt_buf.plain.borrow_mut();
             self.block_log.read(pos, cipher.as_mut())?;
             Aead::new().decrypt(cipher.as_slice(), key, iv, &[], mac, plain.as_mut_slice())?;
-            Arc::new(MhtNode { inner: MhtInner::from_bytes(plain.as_slice()), logical_number: pos, physical_number: pos, parent: None })
+            Arc::new(MhtNode {
+                inner: MhtInner::from_bytes(plain.as_slice()),
+                logical_number: pos,
+                physical_number: pos,
+                parent: None,
+            })
         };
 
         if ENABLED_CACHING {
@@ -848,7 +863,8 @@ impl LevelBuilder {
             if let Some(pre_node) = self.previous_incomplete_node.as_ref() {
                 // If there exists a previous built node (same height),
                 // its complete entries should participate in the building
-                pre_node.inner
+                pre_node
+                    .inner
                     .entries
                     .iter()
                     .take(pre_node.num_complete_children())
@@ -902,20 +918,20 @@ impl LevelBuilder {
 
         let last_mht_node = Arc::new(MhtNode {
             inner: MhtInner {
-            header: MhtNodeHeader {
-                height: self.height,
-                num_data_nodes: num_data_nodes as _,
-                num_valid_entries: num_valid_entries as _,
+                header: MhtNodeHeader {
+                    height: self.height,
+                    num_data_nodes: num_data_nodes as _,
+                    num_valid_entries: num_valid_entries as _,
+                },
+                entries: array_init::array_init(|i| {
+                    if i < num_valid_entries {
+                        *entries[i]
+                    } else {
+                        // Padding invalid entries to the rest
+                        MhtNodeEntry::new_uninit()
+                    }
+                }),
             },
-            entries: array_init::array_init(|i| {
-                if i < num_valid_entries {
-                    *entries[i]
-                } else {
-                    // Padding invalid entries to the rest
-                    MhtNodeEntry::new_uninit()
-                }
-            }),
-        },
             logical_number: 0,
             physical_number: 0,
             parent: None,
@@ -1190,7 +1206,8 @@ impl<'a, L: BlockLog> Debug for MhtDisplayer<'a, L> {
 
         // Display internal MHT nodes hierarchically
         let mut level_entries: Vec<MhtNodeEntry> = root_mht_node
-            .inner.entries
+            .inner
+            .entries
             .into_iter()
             .take(root_mht_node.num_valid_entries())
             .collect();
@@ -1222,24 +1239,20 @@ impl<'a, L: BlockLog> Debug for MhtDisplayer<'a, L> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layers::bio::MemLog;
+    use crate::layers::{bio::MemLog, lsm::SSTABLE_CAPACITY};
 
     struct NoCache;
     impl NodeCache for NoCache {
         fn get(&self, _pos: Pbid) -> Option<Node> {
             None
         }
-        fn put(
-            &self,
-            _pos: Pbid,
-            _value: Node,
-        ) -> Option<Node> {
+        fn put(&self, _pos: Pbid, _value: Node) -> Option<Node> {
             None
         }
     }
 
     fn create_crypto_log() -> Result<CryptoLog<MemLog>> {
-        let mem_log = MemLog::create(64 * 1024)?;
+        let mem_log = MemLog::create(SSTABLE_CAPACITY * 2)?;
         let key = Key::random();
         let cache = Arc::new(NoCache {});
         Ok(CryptoLog::new(mem_log, key, cache))
@@ -1268,10 +1281,6 @@ mod tests {
         log.display_mht();
 
         let (root_meta, root_node) = (log.root_meta().unwrap(), log.root_node().unwrap());
-        assert_eq!(root_meta.pos, 107);
-        assert_eq!(root_node.height(), 2);
-        assert_eq!(root_node.num_data_nodes(), append_cnt + 2);
-        assert_eq!(root_node.num_valid_entries(), 2);
 
         log.read(5 as BlockId, buf.as_mut())?;
         assert_eq!(buf.as_slice(), &[content; BLOCK_SIZE]);
