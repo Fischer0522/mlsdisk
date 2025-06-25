@@ -78,7 +78,7 @@ use std::time::Instant;
 /// then discarded.
 ///
 
-const ENABLED_CACHING: bool = false;
+const ENABLED_CACHING: bool = true;
 
 pub struct CryptoLog<L> {
     mht: RwLock<Box<dyn MHTInterface<L>>>,
@@ -196,7 +196,7 @@ pub const ATTACHED_DATA_NODES_COUNT: usize = 75;
 
 pub const CHILD_MHT_NODES_COUNT: usize = MHT_NBRANCHES - ATTACHED_DATA_NODES_COUNT;
 
-pub const APPEND_ONLY: bool = false; // Whether the MHT is append-only
+pub const APPEND_ONLY: bool = true; // Whether the MHT is append-only
 
 /// The data node (leaf). It contains a block of data.
 

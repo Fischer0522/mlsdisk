@@ -31,7 +31,7 @@ fn init_logger() {
 
 fn main() {
     init_logger();
-    let total_bytes = 2 * GiB;
+    let total_bytes = 5 * GiB;
     let capacity = 20 * GiB;
     // Specify all benchmarks
     let benches = vec![
@@ -45,16 +45,16 @@ fn main() {
         //     .concurrency(1)
         //     .build()
         //     .unwrap(),
-        // BenchBuilder::new("SwornDisk::write_rnd")
-        //     .disk_type(DiskType::SwornDisk)
-        //     .io_type(IoType::Write)
-        //     .io_pattern(IoPattern::Rnd)
-        //     .total_bytes(total_bytes)
-        //     .capacity(capacity)
-        //     .buf_size(4 * KiB)
-        //     .concurrency(1)
-        //     .build()
-        //     .unwrap(),
+        BenchBuilder::new("SwornDisk::write_rnd")
+            .disk_type(DiskType::SwornDisk)
+            .io_type(IoType::Write)
+            .io_pattern(IoPattern::Rnd)
+            .total_bytes(total_bytes)
+            .capacity(capacity)
+            .buf_size(4 * KiB)
+            .concurrency(1)
+            .build()
+            .unwrap(),
         // BenchBuilder::new("SwornDisk::read_seq")
         //     .disk_type(DiskType::SwornDisk)
         //     .io_type(IoType::Read)
@@ -65,16 +65,16 @@ fn main() {
         //     .concurrency(1)
         //     .build()
         //     .unwrap(),
-        BenchBuilder::new("SwornDisk::read_rnd")
-            .disk_type(DiskType::SwornDisk)
-            .io_type(IoType::Read)
-            .io_pattern(IoPattern::Rnd)
-            .total_bytes(total_bytes)
-            .capacity(capacity)
-            .buf_size(4 * KiB)
-            .concurrency(1)
-            .build()
-            .unwrap(),
+        // BenchBuilder::new("SwornDisk::read_rnd")
+        //     .disk_type(DiskType::SwornDisk)
+        //     .io_type(IoType::Read)
+        //     .io_pattern(IoPattern::Rnd)
+        //     .total_bytes(total_bytes)
+        //     .capacity(capacity)
+        //     .buf_size(4 * KiB)
+        //     .concurrency(1)
+        //     .build()
+        //     .unwrap(),
         // Benchmark on `EncDisk` not enabled by default
         // BenchBuilder::new("EncDisk::write_seq")
         //     .disk_type(DiskType::EncDisk)
@@ -625,10 +625,21 @@ mod disks {
 
         fn write_rnd(&self, pos: BlockId, total_nblocks: usize, buf_nblocks: usize) -> Result<()> {
             let buf = Buf::alloc(buf_nblocks)?;
+            let sampling_per_ops = 5000;
 
-            for _ in 0..total_nblocks / buf_nblocks {
+            let mut total_bytes = 0;
+            let mut begin = Instant::now();
+            for i in 0..total_nblocks / buf_nblocks {
                 let rnd_pos = gen_rnd_pos(total_nblocks, buf_nblocks);
                 self.write(pos + rnd_pos, buf.as_ref())?;
+                if i % sampling_per_ops == 0 {
+                    total_bytes += sampling_per_ops * buf_nblocks * BLOCK_SIZE;
+                    let elapsed = begin.elapsed();
+                    let throughput = DisplayThroughput::new(total_bytes, elapsed);
+                    warn!("Random Write Throughput: {}", throughput);
+                    total_bytes = 0;
+                    begin = Instant::now();
+                }
             }
 
             self.sync()

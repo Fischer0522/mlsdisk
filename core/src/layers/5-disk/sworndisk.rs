@@ -30,6 +30,8 @@ pub type Lba = BlockId;
 /// Host Block Address.
 pub type Hba = BlockId;
 
+const DELAYED_RECLAIMATION: bool = true;
+
 /// SwornDisk.
 pub struct SwornDisk<D: BlockSet> {
     inner: Arc<DiskInner<D>>,
@@ -126,7 +128,9 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             let table = block_validity_table.clone();
             let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
                 // Deallocate the host block while the corresponding record is dropped in `MemTable`
-                table.set_deallocated(record.value().hba);
+                if DELAYED_RECLAIMATION {
+                    table.set_deallocated(record.value().hba);
+                }
             };
             TxLsmTree::format(
                 tx_log_store.clone(),
@@ -179,7 +183,9 @@ impl<D: BlockSet + 'static> SwornDisk<D> {
             let table = block_validity_table.clone();
             let on_drop_record_in_memtable = move |record: &dyn AsKV<RecordKey, RecordValue>| {
                 // Deallocate the host block while the corresponding record is dropped in `MemTable`
-                table.set_deallocated(record.value().hba);
+                if DELAYED_RECLAIMATION {
+                    table.set_deallocated(record.value().hba);
+                }
             };
             TxLsmTree::recover(
                 tx_log_store.clone(),
@@ -390,6 +396,14 @@ impl<D: BlockSet + 'static> DiskInner<D> {
         let records = self.write_blocks_from_data_buf()?;
         // Insert new records of data blocks to `TxLsmTree`
         for (key, value) in records {
+            if !DELAYED_RECLAIMATION {
+                if let Ok(value) = self.logical_block_table.get(&key) {
+                    let hba = value.hba;
+                    if hba != value.hba {
+                        self.block_validity_table.set_deallocated(hba);
+                    }
+                }
+            }
             // TODO: Error handling: Should dealloc the written blocks
             self.logical_block_table.put(key, value)?;
         }

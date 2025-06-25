@@ -63,7 +63,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
     pub fn reserve_capacity(&self) {
         // reserve one block for the root node
         let block_log = &self.block_log;
-        let reserved_capacity = ((SSTABLE_CAPACITY * 48 / BLOCK_SIZE) as f64 * 1.2) as u64;
+        let reserved_capacity = ((SSTABLE_CAPACITY * 48 / BLOCK_SIZE) as f64 * 1.5) as u64;
         let buf = Buf::alloc(reserved_capacity as usize).unwrap();
         info!(
             "Creating IMhtStorage with reserved capacity: {}",
@@ -102,7 +102,7 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
         root_meta: RootMhtMeta,
         node_cache: Arc<dyn NodeCache>,
     ) -> Result<Self> {
-        info!("Opening IMht with root key: {:?}", root_key);
+        // info!("Opening IMht with root key: {:?}", root_key);
         let pos = 0;
         let mut cipher = Buf::alloc(1)?;
         let mut plain = Buf::alloc(1)?;
@@ -131,10 +131,10 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
             crypt_buf: CryptBuf::new(),
             logical_offset: 1, // root node is already present
         };
-        info!(
-            "IMhtStorage opened successfully with root node at position: {}",
-            pos
-        );
+        // info!(
+        //     "IMhtStorage opened successfully with root node at position: {}",
+        //     pos
+        // );
         Ok(mht_storage)
     }
 
@@ -335,11 +335,12 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
         data_node.inner = DataInner::from_bytes(plain.as_slice());
 
         let data_node = Arc::new(data_node);
-        Ok(data_node)
-    }
 
-    fn get_data_node(&self, entry: &MhtNodeEntry, node_buf: &mut [u8]) -> Result<()> {
-        todo!()
+        if ENABLED_CACHING {
+            self.node_cache
+                .put(physical_number as usize, Node::DataNode(data_node.clone()));
+        }
+        Ok(data_node)
     }
 
     fn append_mht_node(&self, logical_number: u64) -> Result<MhtNodeRef> {
@@ -353,8 +354,10 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
             mht_node_guard.logical_number = logical_number as usize;
             mht_node_guard.physical_number = physical_number as usize;
         }
-        self.node_cache
-            .put(physical_number as usize, Node::MhtNodeRef(mht_node.clone()));
+        if ENABLED_CACHING {
+            self.node_cache
+                .put(physical_number as usize, Node::MhtNodeRef(mht_node.clone()));
+        }
         Ok(mht_node)
     }
 
@@ -396,8 +399,10 @@ impl<L: BlockLog + 'static> IMhtStorage<L> {
 
         mht_node.inner = MhtInner::from_bytes(plain.as_slice());
         let mht_node = Arc::new(Mutex::new(mht_node));
-        self.node_cache
-            .put(physical_number as usize, Node::MhtNodeRef(mht_node.clone()));
+        if ENABLED_CACHING {
+            self.node_cache
+                .put(physical_number as usize, Node::MhtNodeRef(mht_node.clone()));
+        }
         Ok(mht_node)
     }
 
@@ -468,7 +473,7 @@ impl<L: BlockLog + 'static> IMht<L> {
         root_meta: RootMhtMeta,
         node_cache: Arc<dyn NodeCache>,
     ) -> Result<Self> {
-        info!("Opening IMht with root key: {:?}", root_key);
+        // info!("Opening IMht with root key: {:?}", root_key);
         let mht_storage = IMhtStorage::open(root_key, block_log, root_meta, node_cache)?;
         let mht = Self {
             root: mht_storage.root.clone(),

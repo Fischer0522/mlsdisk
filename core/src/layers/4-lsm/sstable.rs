@@ -15,7 +15,7 @@ use lru::LruCache;
 use pod::Pod;
 
 const ENABLED_CACHING: bool = true;
-const CACHE_CAP: usize = 128;
+const CACHE_CAP: usize = 1024;
 
 /// Sorted String Table (SST) for `TxLsmTree`.
 ///
